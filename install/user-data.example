@@ -1,0 +1,22 @@
+#cloud-config
+# UAV-Link first-boot bootstrap for Raspberry Pi OS (cloud-init).
+#
+# HOW TO USE
+#   1. Flash Raspberry Pi OS with Raspberry Pi Imager and set, under the OS
+#      customization: hostname, username+password, your Wi-Fi (with internet),
+#      SSH, locale/Wi-Fi country. Imager writes user-data/network-config for that.
+#   2. Append the runcmd block below to the boot-partition user-data (or merge it),
+#      picking a release tag that CONTAINS install/install.sh.
+#   3. Boot. The Pi provisions itself over Wi-Fi, then reboots fully configured.
+#      Progress is logged to /boot/firmware/uav-setup.log.
+#
+# Note: the first boot needs the Imager Wi-Fi with internet — the AP fallback only
+# exists after installation. Pin a fixed release tag for reproducible images.
+
+runcmd:
+  # wait for DNS/connectivity (up to ~2 min)
+  - [ sh, -c, 'for i in $(seq 1 60); do getent hosts github.com >/dev/null && break; sleep 2; done' ]
+  # fetch + unpack the pinned release, then run the idempotent installer
+  - [ sh, -c, 'curl -fsSL https://github.com/b14ckyy/UAV-Link/archive/refs/tags/__RELEASE_TAG__.tar.gz | tar -xz -C /opt' ]
+  - [ sh, -c, 'bash /opt/UAV-Link-__RELEASE_TAG__/install/install.sh 2>&1 | tee /boot/firmware/uav-setup.log' ]
+  - [ reboot ]
