@@ -58,8 +58,30 @@ and don't touch the box meanwhile.)
 **Offline alternative:** `poweroff`, take the SD to a PC, and read a full image with
 Raspberry Pi Imager (SD backup) or `dd`/Win32DiskImager.
 
-Either way, RPi OS expands the root partition to fill the target card on first boot, so a
-same-or-larger SD works when flashing the image back.
+## 4. Re-arm first-boot expansion (required) + shrink
+
+RPi OS grows the root filesystem to fill the card only on a **fresh flash's first boot**,
+via a one-shot `init=` entry in `cmdline.txt` that removes itself after running. This Pi
+already consumed that during setup, so the golden image would **not** expand on the user's
+card — it would stay at this source card's size.
+
+Re-arm it (and shrink the image so it downloads/flashes small) with
+[PiShrink](https://github.com/Drewsif/PiShrink), on the Pi or any Linux box with room for
+the decompressed `.img`:
+
+```bash
+gunzip uav-link-backup-*.img.gz
+curl -fsSL https://raw.githubusercontent.com/Drewsif/PiShrink/master/pishrink.sh -o pishrink.sh
+chmod +x pishrink.sh
+sudo apt-get install -y parted            # e2fsprogs is already present
+sudo ./pishrink.sh -Z uav-link-backup-*.img   # shrink to used size + re-arm expand + xz
+```
+
+PiShrink injects its own expand-on-first-boot service (independent of `cmdline.txt`) and
+re-enables it by default — do **not** pass `-s` (that disables it). The resulting
+`.img.xz` flashes small and grows to fill any card **>= the source card (8 GB)** on the
+user's first boot. (No PiShrink? The image still boots; users run
+`sudo raspi-config --expand-rootfs` once to reclaim the rest.)
 
 ## Result
 
