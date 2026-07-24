@@ -57,7 +57,7 @@ install -m 755 "$0" /usr/local/sbin/uav-firstboot 2>/dev/null || cp "$0" /usr/lo
 cat > /etc/systemd/system/uav-firstboot.service <<EOF
 [Unit]
 Description=UAV-Link first-boot installer
-After=network-online.target cloud-final.service
+After=network-online.target
 Wants=network-online.target
 ConditionPathExists=!$BOOT/.uav-installed
 [Service]
