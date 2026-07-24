@@ -1,0 +1,9 @@
+[Unit]
+Description=UAV-Link SD -> USB image backup
+
+[Service]
+Type=oneshot
+# mark "starting" immediately so the web UI shows progress before detection finishes
+ExecStartPre=__UAVLINK_DIR__/uav-backup --starting
+ExecStart=__UAVLINK_DIR__/uav-backup
+TimeoutStartSec=0

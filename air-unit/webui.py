@@ -304,6 +304,30 @@ def net_counters():
     return counters
 
 
+def usb_backup_target():
+    """First USB block device (never the SD) + its first filesystem partition.
+    Detection only -- lsblk needs no root."""
+    rows = []
+    for line in sh(['lsblk', '-Pno',
+                    'NAME,TYPE,TRAN,FSTYPE,SIZE,MODEL,PKNAME,MOUNTPOINT']).splitlines():
+        d = dict(re.findall(r'(\w+)="([^"]*)"', line))
+        if d:
+            rows.append(d)
+    disk = next((r for r in rows
+                 if r.get('TYPE') == 'disk' and r.get('TRAN') == 'usb'), None)
+    if not disk:
+        return None
+    part = next((r for r in rows if r.get('TYPE') == 'part'
+                 and r.get('PKNAME') == disk['NAME'] and r.get('FSTYPE')), None)
+    return {
+        'name': disk['NAME'], 'size': disk.get('SIZE', '?'),
+        'model': (disk.get('MODEL') or '').strip(),
+        'part': part['NAME'] if part else '',
+        'fstype': part.get('FSTYPE', '') if part else '',
+        'mountpoint': part.get('MOUNTPOINT', '') if part else '',
+    }
+
+
 TEMPLATE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -332,6 +356,9 @@ TEMPLATE = """<!doctype html>
   .url { font-family: monospace; background: #12161a; padding: .3em .5em;
          border-radius: 4px; display: inline-block; }
   .hint { font-size: .78em; color: #7c8791; margin-top: .2em; }
+  .hint.bad { color: #e07a5f; }
+  h3 { font-size: .92em; color: #c3ccd4; font-weight: 600; margin: .2em 0 .5em; }
+  .sep { border: 0; border-top: 1px solid #2a323a; margin: 1.4em 0; }
   #preview-img { width: 100%; border-radius: 6px; margin-top: .8em;
                  display: none; background: #000; }
   .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr);
@@ -438,8 +465,9 @@ TEMPLATE = """<!doctype html>
   <button type="submit">Save &amp; restart pipeline</button>
 </form></div>
 
-<h2>Cellular (WWAN)</h2>
+<h2>Network</h2>
 <div class="card">
+  <h3>Cellular (WWAN)</h3>
   <div class="kv">
     <span>Status</span><span>{{ modem.state }}</span>
     <span>Network</span><span>{{ modem.operator }} ({{ modem.tech }})</span>
@@ -466,17 +494,13 @@ TEMPLATE = """<!doctype html>
           <input type="checkbox" name="clear_pin" value="1"
                  style="width:auto"> clear stored PIN</label></div>
     </div>
-    <div class="hint">Tip: an empty APN uses the modem's default bearer — try
-      this first. If the modem sticks at "registered" with an explicit APN,
-      clear the APN field (some networks reject a second PDN with the same
-      name). Leave username empty to clear credentials. A stored SIM PIN is
-      used to unlock the SIM automatically on connect.</div>
+    <div class="hint">Empty APN = modem default bearer (try first). SIM PIN only for locked cards.</div>
     <button type="submit">Save APN &amp; reconnect</button>
   </form>
-</div>
 
-<h2>Wi-Fi</h2>
-<div class="card">
+  <hr class="sep">
+
+  <h3>Wi-Fi</h3>
   <div class="kv">
     <span>Radio</span>
     <span class="{{ 'ok' if wifi_on else 'bad' }}">
@@ -502,12 +526,9 @@ TEMPLATE = """<!doctype html>
       </form>
     </div>
   </div>
-  <div class="hint">Safety net: Wi-Fi is forced back ON at every boot.
-    Fallback: if no known network connects within 60 s after boot or radio-on,
-    the Pi starts access point <b>UAV-Link</b> (WPA2, password <b>uavlink2026</b>,
-    page at http://10.42.0.1:8080). Holding GPIO21 (pin 40) to GND (pin 39) for
-    3 s starts it manually. VPN over LTE stays active in every mode.
-    Disabling Wi-Fi drops LAN access — continue on <b>http://10.192.1.1:8080</b>.</div>
+  <div class="hint">Forced ON at boot. No known network within 60 s &rarr; access point
+    <b>UAV-Link</b> (pw <b>uavlink2026</b>, http://10.42.0.1:8080); or hold GPIO21/pin40
+    3 s. Disabling drops LAN &mdash; continue on <b>http://10.192.1.1:8080</b>.</div>
   <form method="post" action="/hotspot_pw" onsubmit="return pwMatch(this,'psk')">
     <label>Access-point (hotspot) password</label>
     <div class="row">
@@ -518,10 +539,10 @@ TEMPLATE = """<!doctype html>
     </div>
     <button type="submit" class="secondary">Change hotspot password</button>
   </form>
-</div>
 
-<h2>Known Wi-Fi Networks</h2>
-<div class="card">
+  <hr class="sep">
+
+  <h3>Known networks</h3>
   {% if wifi_nets %}
   <table style="width:100%;border-collapse:collapse">
     {% for n in wifi_nets %}
@@ -551,7 +572,6 @@ TEMPLATE = """<!doctype html>
     </div>
     <button type="submit">Add network</button>
   </form>
-  <div class="hint">The Pi auto-connects to any saved network in range.</div>
 </div>
 
 <h2>VPN (WireGuard)</h2>
@@ -663,6 +683,27 @@ TEMPLATE = """<!doctype html>
   </form>
   <div class="hint">Re-runs the installer from the selected channel (over LTE or Wi-Fi).
     Config and password are preserved. Log: <code>/var/log/uav-update.log</code>.</div>
+</div>
+
+<h2>System Backup</h2>
+<div class="card">
+  <div class="kv">
+    <span>USB target</span>
+    <span>{% if usb %}{{ usb.model or ('/dev/' + usb.name) }} &middot; {{ usb.size }}
+      {% if usb.fstype %}&middot; {{ usb.fstype }}{% else %}<span class="bad">(no filesystem)</span>{% endif %}
+      {% else %}<span class="bad">none detected</span>{% endif %}</span>
+  </div>
+  {% if usb and usb.fstype == 'vfat' %}
+  <div class="hint bad">FAT32 target: images larger than 4 GiB will fail &mdash; use exFAT/ext4 for big cards.</div>
+  {% endif %}
+  <form method="post" action="/backup"
+        onsubmit="return confirm('Write a full compressed image of the SD card to the USB stick?\\nThis reads the whole card and can take 10-30 min.');">
+    <button type="submit"{% if not (usb and usb.fstype) %} disabled{% endif %}>Create backup to USB</button>
+  </form>
+  <div id="backup-status" class="hint" style="margin-top:.8em"></div>
+  <div class="hint">Writes a compressed <code>.img.gz</code> of the whole SD card as a file
+    onto the stick (its existing data is kept). Plug in a stick and reload if none is
+    listed. Log: <code>/var/log/uav-backup.log</code>.</div>
 </div>
 
 <h2>Status Display (OLED)</h2>
@@ -829,9 +870,40 @@ function togglePreview() {
   previewTimer = setInterval(refresh, 3000);
 }
 
+function fmtSize(b) {
+  if (!b) return '0 B';
+  const u = ['B', 'KiB', 'MiB', 'GiB']; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+function pollBackup() {
+  const el = document.getElementById('backup-status');
+  if (!el) return;
+  fetch('/api/backup').then(r => r.json()).then(s => {
+    const name = (s.dest || '').split('/').pop();
+    if (s.state === 'starting') {
+      el.innerHTML = 'Starting backup…';
+      setTimeout(pollBackup, 1500);
+    } else if (s.state === 'running') {
+      const pct = (s.percent != null) ? s.percent + '% ' : '';
+      const done = s.bytes ? '(' + fmtSize(s.bytes) + ' of ' + fmtSize(s.total) + ' read)' : '';
+      el.innerHTML = 'Backing up… ' + pct + '<span class="hint">' + done + '</span>';
+      setTimeout(pollBackup, 3000);
+    } else if (s.state === 'done') {
+      el.innerHTML = '<span class="ok">Done:</span> ' + name +
+                     ' (' + fmtSize(s.size) + ') — safe to remove the stick.';
+    } else if (s.state === 'error') {
+      el.innerHTML = '<span class="bad">Backup failed:</span> ' + (s.error || 'unknown');
+    } else {
+      el.textContent = '';
+    }
+  }).catch(() => {});
+}
+
 loadFormats();
 pollStats();
 setInterval(pollStats, 2000);
+pollBackup();
 </script>
 </body></html>"""
 
@@ -923,6 +995,7 @@ def index():
         bitrates=list(range(1000, 5001, 500)),
         msp=msp_config(cfg), msp_bauds=MSP_BAUDS, vpn_ip=wg_ip(),
         oled=oled_config(cfg), version=uav_version(),
+        usb=usb_backup_target(),
         default_pw=is_default_password(),
         ap_pw_warn=(wifi_status()[0] and hotspot_pw_default()),
         wifi_on=sh(['nmcli', 'radio', 'wifi']) == 'enabled',
@@ -1087,6 +1160,40 @@ def update():
     sh(['sudo', 'systemctl', 'start', '--no-block',
         f'uav-update@{channel}.service'], timeout=15)
     return render_template_string(UPDATING_TEMPLATE, channel=channel)
+
+
+@app.route('/backup', methods=['POST'])
+def backup():
+    # only start if a USB stick with a filesystem is actually present
+    usb = usb_backup_target()
+    if usb and usb.get('fstype'):
+        sh(['sudo', 'systemctl', 'start', '--no-block',
+            'uav-backup.service'], timeout=15)
+    return redirect('/')
+
+
+@app.route('/api/backup')
+def api_backup():
+    try:
+        with open('/run/uav-backup.status') as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return jsonify({'state': 'idle'})
+    if st.get('state') == 'running' and st.get('total'):
+        try:
+            with open('/run/uav-backup.progress') as f:
+                raw = f.read().replace('\r', '\n')
+            last = 0
+            for line in raw.splitlines():
+                m = re.match(r'\s*(\d+) bytes', line)
+                if m:
+                    last = int(m.group(1))
+            if last:
+                st['bytes'] = last
+                st['percent'] = round(last * 100 / int(st['total']), 1)
+        except (OSError, ValueError):
+            pass
+    return jsonify(st)
 
 
 @app.route('/oled', methods=['POST'])

@@ -48,10 +48,18 @@ access point ~60 s after boot → the whole base setup is done over the AP + web
 
 ## 3. Pull the image
 
-Power off, take the SD to a PC, read a full image of it (Raspberry Pi Imager can back up
-an SD, or `dd`/Win32DiskImager). Shrink/compress if you like (`.img.gz`/`.xz`/`.zst` —
-Imager writes those directly). RPi OS expands the root partition to fill the target card
-on first boot, so a same-or-larger SD works.
+**Easiest — built-in (web UI → System Backup):** do the strip steps in section 2 but
+**skip the `poweroff`**. Plug a USB stick (exFAT/ext4 for cards >4 GB — FAT32 caps files
+at 4 GiB), open the web UI, and hit **Create backup to USB**. It writes a compressed
+`uav-link-backup-*.img.gz` of the whole card straight onto the stick (~10–30 min). That
+file *is* the golden image. (Reads the live card, so run it right after the strip commands
+and don't touch the box meanwhile.)
+
+**Offline alternative:** `poweroff`, take the SD to a PC, and read a full image with
+Raspberry Pi Imager (SD backup) or `dd`/Win32DiskImager.
+
+Either way, RPi OS expands the root partition to fill the target card on first boot, so a
+same-or-larger SD works when flashing the image back.
 
 ## Result
 

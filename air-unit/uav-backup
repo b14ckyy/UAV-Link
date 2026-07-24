@@ -1,0 +1,87 @@
+#!/bin/bash
+# UAV-Link SD -> USB image backup. Run as root by the web UI via uav-backup.service.
+# Writes a gzip-compressed image of the whole SD card as a FILE onto the first
+# detected USB stick's existing filesystem (the stick's data is preserved -- we
+# never write to a raw device). Long-running (whole card is read); progress is
+# reported to /run/uav-backup.status for the web UI to poll.
+set -uo pipefail
+
+STATUS=/run/uav-backup.status
+PROG=/run/uav-backup.progress
+LOG=/var/log/uav-backup.log
+MNT=/mnt/uav-backup
+
+# ExecStartPre hook: mark "starting" instantly (before the slow detection/mount) so
+# the web UI shows feedback the moment the button is pressed.
+if [ "${1:-}" = "--starting" ]; then
+    printf '{"state":"starting"}\n' > "$STATUS"
+    exit 0
+fi
+
+exec >>"$LOG" 2>&1
+echo "==================================================================="
+echo "[uav-backup] $(date -u '+%Y-%m-%dT%H:%M:%SZ') start"
+
+status() { printf '%s\n' "$1" > "$STATUS"; }
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+MOUNTED=0
+fail() {
+    echo "[uav-backup] ERROR: $1"
+    status "{\"state\":\"error\",\"error\":\"$(json_str "$1")\"}"
+    [ "$MOUNTED" = 1 ] && umount "$MNT" 2>/dev/null
+    exit 1
+}
+
+# --- source: the disk backing / (the SD card) ---------------------------------
+ROOTSRC="$(findmnt -no SOURCE / 2>/dev/null)"
+SD="$(lsblk -no pkname "$ROOTSRC" 2>/dev/null | head -1)"
+SRC="/dev/$SD"
+[ -n "$SD" ] && [ -b "$SRC" ] || fail "cannot determine the SD card device"
+
+# --- destination: first USB stick ---------------------------------------------
+USB="$(lsblk -dno NAME,TRAN | awk '$2=="usb"{print $1; exit}')"
+[ -n "$USB" ] || fail "no USB stick detected -- plug one in"
+[ "/dev/$USB" != "$SRC" ] || fail "refusing: USB target is the boot device"
+# first partition on it that carries a filesystem
+PART="$(lsblk -rno NAME,FSTYPE "/dev/$USB" | awk 'NR>1 && $2!=""{print $1; exit}')"
+[ -n "$PART" ] || fail "USB stick has no usable filesystem -- format it (exFAT/ext4)"
+DEVPART="/dev/$PART"
+FS="$(lsblk -no FSTYPE "$DEVPART" | head -1)"
+
+# --- mount it (reuse an existing mount if already mounted) --------------------
+MP="$(findmnt -fno TARGET "$DEVPART" 2>/dev/null)"
+if [ -z "$MP" ]; then
+    mkdir -p "$MNT"
+    mount "$DEVPART" "$MNT" || fail "mounting $DEVPART failed"
+    MOUNTED=1; MP="$MNT"
+fi
+
+# --- space guard --------------------------------------------------------------
+TOTAL="$(blockdev --getsize64 "$SRC")"
+FREE="$(df -B1 --output=avail "$MP" | tail -1 | tr -d ' ')"
+# gzip usually shrinks a lot, but guard against a too-small stick: need >=40% of raw
+NEED=$(( TOTAL * 40 / 100 ))
+[ "${FREE:-0}" -ge "$NEED" ] || fail "not enough free space on USB ($((FREE/1024/1024)) MiB free, need ~$((NEED/1024/1024)) MiB)"
+
+DEST="$MP/uav-link-backup-$(date -u '+%Y%m%d-%H%M').img.gz"
+status "{\"state\":\"running\",\"src\":\"$SRC\",\"usb\":\"/dev/$PART\",\"dest\":\"$(json_str "$DEST")\",\"total\":$TOTAL,\"fstype\":\"$FS\"}"
+: > "$PROG"
+echo "[uav-backup] $SRC ($TOTAL bytes) -> $DEST (fs=$FS, free=$FREE)"
+
+# --- image it (read-only source; file on the mounted USB fs) ------------------
+if dd if="$SRC" bs=4M status=progress 2>"$PROG" | gzip > "$DEST"; then
+    sync
+    SIZE="$(stat -c %s "$DEST" 2>/dev/null || echo 0)"
+    status "{\"state\":\"done\",\"dest\":\"$(json_str "$DEST")\",\"total\":$TOTAL,\"size\":$SIZE}"
+    echo "[uav-backup] done: $DEST ($SIZE bytes)"
+    RC=0
+else
+    echo "[uav-backup] dd/gzip failed (disk full? FAT32 4 GiB limit?)"
+    rm -f "$DEST"
+    status "{\"state\":\"error\",\"error\":\"write failed (disk full, or FAT32 4 GiB file limit)\"}"
+    RC=1
+fi
+
+[ "$MOUNTED" = 1 ] && umount "$MNT" 2>/dev/null
+echo "[uav-backup] finished (exit $RC)"
+exit $RC
