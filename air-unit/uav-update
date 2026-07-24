@@ -1,9 +1,10 @@
 #!/bin/bash
 # UAV-Link self-update helper. Run as root by the web UI via uav-update@<channel>.service.
 #   channel: development | beta | releases
-#     development -> main branch (dev)
-#     beta        -> newest GitHub Release, including pre-releases
-#     releases    -> latest stable GitHub Release (pre-releases excluded)
+#     development -> main branch (dev)               [API-free]
+#     releases    -> latest stable GitHub Release     [API-free: latest-release redirect]
+#     beta        -> newest Release incl. pre-release [uses the GitHub API, 60/h/IP;
+#                    may rate-limit behind shared CGNAT — the other two channels do not]
 # Downloads that source package and runs its install.sh (idempotent: config +
 # credentials are preserved). Logs to /var/log/uav-update.log.
 set -uo pipefail
@@ -25,7 +26,9 @@ case "$CHANNEL" in
         [ -n "$TAG" ] || { echo "[uav-update] no release published (beta channel empty)"; exit 1; }
         URL="https://github.com/$REPO/archive/refs/tags/$TAG.tar.gz"; NAME="$TAG" ;;
     releases|*)
-        TAG="$(api 'releases/latest' | tag_of)"
+        # API-free (robust behind CGNAT/LTE): follow the "latest release" redirect
+        LOC="$(curl -sI "https://github.com/$REPO/releases/latest" | grep -i '^location:' | tr -d '\r')"
+        TAG="$(echo "$LOC" | grep -oE 'tag/[^/[:space:]]+$' | sed 's#tag/##')"
         [ -n "$TAG" ] || { echo "[uav-update] no stable release published (releases channel empty)"; exit 1; }
         URL="https://github.com/$REPO/archive/refs/tags/$TAG.tar.gz"; NAME="$TAG" ;;
 esac
