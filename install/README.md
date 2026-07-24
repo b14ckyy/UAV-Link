@@ -15,9 +15,10 @@ credentials, adds boot-config edits only once, and skips work already done.
    ```
    systemd.run=/boot/firmware/firstboot.sh
    ```
-4. Boot. The Pi waits for Wi-Fi, installs itself, and reboots fully configured. It runs
-   exactly once (removes its own token + drops a `.uav-installed` marker). Progress log:
-   `uav-setup.log` on the boot partition.
+4. Boot. It runs in two automatic stages (the `systemd.run` hook boots into a minimal
+   target with no network, so stage 1 just schedules a proper networked installer and
+   reboots; stage 2 installs during a normal boot and reboots again, fully configured).
+   Runs exactly once. Progress log: `uav-setup.log` on the boot partition.
 
 Edit `REF=` at the top of `firstboot.sh` to pin a release tag instead of `main` for
 reproducible images. (A cloud-init variant is in [`user-data.example`](user-data.example).)
