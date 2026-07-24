@@ -24,6 +24,8 @@ exec >>"$BOOT/uav-setup.log" 2>&1
 if [ "${1:-}" = install ]; then
     echo "[firstboot] stage 2: installing (ref=$REF)"
     [ -f "$BOOT/.uav-installed" ] && exit 0
+    # wait until cloud-init has finished provisioning the user (fresh flashes)
+    command -v cloud-init >/dev/null 2>&1 && cloud-init status --wait >/dev/null 2>&1
     for i in $(seq 1 60); do getent hosts github.com >/dev/null 2>&1 && break; sleep 2; done
     cd /opt 2>/dev/null || cd /tmp
     if curl -fsSL "https://github.com/b14ckyy/UAV-Link/archive/refs/heads/$REF.tar.gz" -o uav.tgz \
@@ -55,7 +57,7 @@ install -m 755 "$0" /usr/local/sbin/uav-firstboot 2>/dev/null || cp "$0" /usr/lo
 cat > /etc/systemd/system/uav-firstboot.service <<EOF
 [Unit]
 Description=UAV-Link first-boot installer
-After=network-online.target
+After=network-online.target cloud-final.service
 Wants=network-online.target
 ConditionPathExists=!$BOOT/.uav-installed
 [Service]
