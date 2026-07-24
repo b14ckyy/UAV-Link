@@ -29,6 +29,12 @@ sudo chown link:link /home/link/uav-link/config.json
 # no baked Wi-Fi client profiles (AP-only base state)
 for c in $(nmcli -t -f NAME,TYPE connection show | awk -F: '$2=="802-11-wireless"&&$1!="uav-hotspot"{print $1}'); do sudo nmcli connection delete "$c"; done
 
+# no update leftovers / caches baked into the image
+rm -rf /home/link/UAV-Link-*                          # manual tarball extraction dirs
+sudo rm -rf /tmp/tmp.*                                # interrupted uav-update temp dirs
+sudo truncate -s 0 /var/log/uav-update.log           # your test-update history
+sudo apt-get clean                                   # apt .deb cache (shrinks the image)
+
 # unique per clone
 sudo truncate -s 0 /etc/machine-id
 sudo rm -f /etc/ssh/ssh_host_*                       # regenerated on first boot

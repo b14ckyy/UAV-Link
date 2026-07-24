@@ -35,25 +35,25 @@ esac
 
 echo "[uav-update] fetching $NAME"
 D="$(mktemp -d)"
+trap 'rm -rf "$D"' EXIT           # always clean up the download, even on failure/kill
 TB="$D/pkg.tar.gz"
 if ! curl -fsSL "$URL" -o "$TB"; then
-    echo "[uav-update] download failed"; rm -rf "$D"; exit 1
+    echo "[uav-update] download failed"; exit 1
 fi
 # API-free commit id: GitHub tarballs are git-archive output, whose pax global
 # header carries the full commit SHA -- no API call, works behind CGNAT/LTE.
 COMMIT="$(zcat "$TB" 2>/dev/null | head -c 2048 | tr -d '\0' | grep -aoE 'comment=[0-9a-f]{40}' | head -1 | sed 's/comment=//')"
 COMMIT="${COMMIT:0:7}"
 if ! tar -xzf "$TB" -C "$D"; then
-    echo "[uav-update] extract failed"; rm -rf "$D"; exit 1
+    echo "[uav-update] extract failed"; exit 1
 fi
 rm -f "$TB"
 SH="$(echo "$D"/*/install/install.sh)"
-[ -f "$SH" ] || { echo "[uav-update] install.sh missing in package"; rm -rf "$D"; exit 1; }
+[ -f "$SH" ] || { echo "[uav-update] install.sh missing in package"; exit 1; }
 # commit date: git archive stamps every file's mtime with the commit time (API-free)
 CDATE="$(date -u -d "@$(stat -c %Y "$SH" 2>/dev/null || echo 0)" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
 echo "[uav-update] running installer (channel=$CHANNEL commit=${COMMIT:-?} committed=${CDATE:-?})"
 UAV_CHANNEL="$CHANNEL" UAV_COMMIT="${COMMIT:-unknown}" UAV_COMMIT_DATE="${CDATE:-}" bash "$SH"
 RC=$?
-rm -rf "$D"
 echo "[uav-update] done (exit $RC)"
 exit $RC
