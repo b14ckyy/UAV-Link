@@ -57,13 +57,25 @@ WireGuard (paste/upload client config), MSP/MAVLink, OLED, system stats. IP-base
 (default password `uavlink2026`, forced change on first connect). Reachable over LAN,
 Wi-Fi AP, or the VPN.
 
+## Safety & security
+
+**Change the default passwords first** (web UI, Wi-Fi AP, and the `link` SSH account all
+ship as `uavlink2026`). Over cellular, the firewall seals the raw LTE link — nothing is
+reachable on the public IP, so **remote access requires the WireGuard VPN and can't be
+bypassed**. For lowest latency, run the WireGuard server on the GCS itself. Full details:
+[`SAFETY.md`](SAFETY.md).
+
 ## Status
 
 Streaming, network, config center, serial bridge (MSP+MAVLink), firewall, hotspot
-fallback, OLED and web-auth are built and tested. Pending: idempotent one-shot
-installer (cloud-init first-boot bootstrap) and field validation. A native C rewrite of
-the bridge was evaluated and **dropped** — Python is robust enough for this off-the-
-flight-loop role.
+fallback, OLED, web-auth, the idempotent installer, the in-UI software updater
+(Releases/Beta/Development), SD→USB backup, and a flashable golden image are all built.
+Pending: field validation (real FC over MSP/MAVLink, video over LTE end-to-end). A native
+C rewrite of the bridge was evaluated and **dropped** — Python is robust enough for this
+off-the-flight-loop role.
+
+Install: run [`install/install.sh`](install/README.md) on a fresh Raspberry Pi OS, or flash
+the prebuilt golden image and update from the web UI.
 
 ## Secrets
 
