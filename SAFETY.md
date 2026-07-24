@@ -53,7 +53,8 @@ trusted bench/home network without the VPN. The security model assumes Wi-Fi is 
   be recovered.
 - No known network within 60 s → the Pi raises the `UAV-Link` access point; or hold
   **GPIO21 / pin 40** for 3 s to raise it manually.
-- Disabling Wi-Fi drops LAN access — continue over the VPN at `http://10.192.1.1:8080`.
+- Disabling Wi-Fi drops LAN access — continue over the VPN at the unit's WireGuard address
+  (whatever range you assigned in `wgnet.conf`; the web UI shows the actual address).
 - **Arm → Wi-Fi off:** Wi-Fi auto-disables ~30 s after the FC arms (config `arm_wifi_off`,
   default **off** for safe validation — logs the intent instead of cutting).
 

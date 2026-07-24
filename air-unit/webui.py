@@ -528,7 +528,8 @@ TEMPLATE = """<!doctype html>
   </div>
   <div class="hint">Forced ON at boot. No known network within 60 s &rarr; access point
     <b>UAV-Link</b> (pw <b>uavlink2026</b>, http://10.42.0.1:8080); or hold GPIO21/pin40
-    3 s. Disabling drops LAN &mdash; continue on <b>http://10.192.1.1:8080</b>.</div>
+    3 s. Disabling drops LAN &mdash; continue over the VPN{% if vpn_ip %} at
+    <b>http://{{ vpn_ip }}:8080</b>{% endif %}.</div>
   <form method="post" action="/hotspot_pw" onsubmit="return pwMatch(this,'psk')">
     <label>Access-point (hotspot) password</label>
     <div class="row">
@@ -798,7 +799,8 @@ function confirmWifi() {
   const act = document.querySelector('#wifi-form input[name=action]').value;
   if (act === 'off') {
     return confirm('Disable Wi-Fi until the next reboot?\\n' +
-                   'This page stays reachable at http://10.192.1.1:8080 (VPN/LTE).');
+                   'This page stays reachable over the VPN{% if vpn_ip %} at ' +
+                   'http://{{ vpn_ip }}:8080{% endif %} (WireGuard/LTE).');
   }
   return true;
 }
