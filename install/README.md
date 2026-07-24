@@ -4,14 +4,23 @@ Two ways to install onto a Raspberry Pi (Zero 2W target). The installer is
 **idempotent** — safe to re-run; it preserves your `config.json` and web/hotspot
 credentials, adds boot-config edits only once, and skips work already done.
 
-## A. Automatic (fresh image, first boot)
+## A. Automatic — boot-partition drop-in (simplest, no console)
 
-Flash stock Raspberry Pi OS with Raspberry Pi Imager, set hostname / user / **Wi-Fi
-with internet** / SSH / locale in the customization dialog, then add the bootstrap
-from [`user-data.example`](user-data.example) to the boot-partition `user-data`,
-pinning a release tag that contains `install/install.sh`. On first boot the Pi
-provisions itself over Wi-Fi and reboots fully configured (log:
-`/boot/firmware/uav-setup.log`).
+1. Flash stock Raspberry Pi OS with Raspberry Pi Imager; in the customization dialog
+   set the user, **Wi-Fi with internet**, SSH and locale (the normal, no-file-editing way).
+2. Copy [`firstboot.sh`](firstboot.sh) to the **boot partition** (the small FAT drive
+   that appears after flashing). Keep the filename.
+3. Append one token to the **end** of `cmdline.txt` on that same partition — it is a
+   single line, add a leading space and **no** newline:
+   ```
+   systemd.run=/boot/firmware/firstboot.sh
+   ```
+4. Boot. The Pi waits for Wi-Fi, installs itself, and reboots fully configured. It runs
+   exactly once (removes its own token + drops a `.uav-installed` marker). Progress log:
+   `uav-setup.log` on the boot partition.
+
+Edit `REF=` at the top of `firstboot.sh` to pin a release tag instead of `main` for
+reproducible images. (A cloud-init variant is in [`user-data.example`](user-data.example).)
 
 ## B. Manual (existing system / testing)
 
