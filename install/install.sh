@@ -45,9 +45,20 @@ install -d -o "$UAV_USER" -g "$UAV_USER" "$UAV_DIR"
 cp -a "$REPO/air-unit/." "$UAV_DIR/"
 # never clobber the operator's runtime config / credentials
 [ -f "$UAV_DIR/config.json" ] || cp "$UAV_DIR/config.example.json" "$UAV_DIR/config.json"
-# record the installed version (repo dir name -> e.g. "2026-01-b2" or "main")
-VER="$(basename "$REPO")"; VER="${VER#UAV-Link-}"
-echo "$VER ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))" > "$UAV_DIR/VERSION"
+# record version metadata as JSON. uav-update passes channel/commit/commit-date;
+# fall back to git or the extracted files' mtime (git archive stamps commit time).
+REF="$(basename "$REPO")"; REF="${REF#UAV-Link-}"
+CH="${UAV_CHANNEL:-manual}"
+COMMIT="${UAV_COMMIT:-}"
+CDATE="${UAV_COMMIT_DATE:-}"
+if [ -z "$COMMIT" ] && command -v git >/dev/null 2>&1 && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    COMMIT="$(git -C "$REPO" rev-parse --short=7 HEAD 2>/dev/null)"
+    [ -n "$CDATE" ] || CDATE="$(git -C "$REPO" log -1 --format=%cd --date=format:'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+fi
+[ -n "$COMMIT" ] || COMMIT="unknown"
+[ -n "$CDATE" ] || CDATE="$(date -u -d "@$(stat -c %Y "$0" 2>/dev/null || echo 0)" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+printf '{"channel":"%s","ref":"%s","commit":"%s","commit_date":"%s","updated":"%s"}\n' \
+    "$CH" "$REF" "$COMMIT" "$CDATE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$UAV_DIR/VERSION"
 chown -R "$UAV_USER:$UAV_USER" "$UAV_DIR"
 chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
 

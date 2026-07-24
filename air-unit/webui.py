@@ -211,11 +211,26 @@ def oled_config(cfg):
 
 
 def uav_version():
+    info = {'channel': '', 'ref': '', 'commit': '', 'commit_date': '', 'updated': ''}
     try:
         with open(os.path.join(BASE, 'VERSION')) as f:
-            return f.read().strip() or 'unknown'
+            raw = f.read().strip()
     except OSError:
-        return 'unknown'
+        raw = ''
+    try:
+        info.update(json.loads(raw))
+    except (ValueError, TypeError):
+        info['ref'] = raw            # legacy plain-text VERSION ("main (2026-...Z)")
+
+    def fmt(ts):                     # "2026-07-24T19:30:00Z" -> "2026-07-24 19:30Z"
+        return (ts[:16].replace('T', ' ') + 'Z') if len(ts) >= 16 else ts
+    head = info['channel'] or info['ref'] or 'unknown'
+    if info['commit'] and info['commit'] != 'unknown':
+        head += ' @ ' + info['commit']
+    info['head'] = head
+    info['commit_date_fmt'] = fmt(info['commit_date'])
+    info['updated_fmt'] = fmt(info['updated'])
+    return info
 
 
 def wg_ip():
@@ -626,15 +641,21 @@ TEMPLATE = """<!doctype html>
 
 <h2>Software Update</h2>
 <div class="card">
-  <div class="kv"><span>Installed</span><span>{{ version }}</span></div>
+  <div class="kv"><span>Installed</span><span>{{ version.head }}</span></div>
+  {% if version.commit_date_fmt or version.updated_fmt %}
+  <div class="hint" style="margin:-4px 0 8px">
+    {%- if version.commit_date_fmt %}committed {{ version.commit_date_fmt }}{% endif %}
+    {%- if version.commit_date_fmt and version.updated_fmt %} &middot; {% endif %}
+    {%- if version.updated_fmt %}updated {{ version.updated_fmt }}{% endif %}
+  </div>{% endif %}
   <form method="post" action="/update"
         onsubmit="return confirm('Update now? The web UI is unavailable for ~1-2 min.');">
     <div class="row">
       <div><label>Channel</label>
         <select name="channel">
-          <option value="releases">Releases (stable)</option>
-          <option value="beta">Beta (pre-releases)</option>
-          <option value="development">Development (main)</option>
+          <option value="releases"{{ ' selected' if version.channel=='releases' else '' }}>Releases (stable)</option>
+          <option value="beta"{{ ' selected' if version.channel=='beta' else '' }}>Beta (pre-releases)</option>
+          <option value="development"{{ ' selected' if version.channel=='development' else '' }}>Development (main)</option>
         </select></div>
       <div style="display:flex;align-items:flex-end">
         <button type="submit" style="margin:0">Update now</button></div>
