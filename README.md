@@ -30,6 +30,13 @@ Everything is configured from a self-contained web UI on the Pi; no cloud, no ap
   so only the tunnel is reachable over cellular (LAN/VPN stay open). Wi-Fi AP fallback
   when no known network appears.
 
+## Hardware
+
+Reference build: **Raspberry Pi Zero 2 W + Waveshare SIM7600G-H 4G HAT** + a USB CVBS→UVC
+(MJPG) dongle. The cellular layer runs through ModemManager, so most 4G/5G modems work
+without code changes. Tested vs. untested parts and modem-portability notes:
+[`HARDWARE.md`](HARDWARE.md).
+
 ## Layout
 
 | Path | What |
