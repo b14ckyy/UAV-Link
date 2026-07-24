@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+#
+# UAV-Link Firewall: LTE (wwan0) haerten, alles andere offen lassen.
+#
+# Modell:
+#  - wlan0/eth0 (LAN) + wgnet (entschluesselter VPN-Tunnel): voller Zugriff.
+#  - wwan0 (rohes LTE): NUR Rueckverkehr zu vom Pi selbst initiierten Verbindungen
+#    (= der WireGuard-Tunnel; conntrack "established"). Alles Unaufgeforderte wird
+#    verworfen -> kein offener Port, kein Ping-Echo. Wer die CGNAT/oeffentliche IP
+#    kennt, erreicht ueber LTE nichts. GCS-Traffic kommt entschluesselt auf wgnet
+#    an (nicht wwan0) und ist damit nicht betroffen.
+#  - OUTPUT/FORWARD bleiben offen (Pi darf raus; LAN<->VPN-Routing unberuehrt).
+
+flush ruleset
+
+table inet uav_fw {
+    chain input {
+        type filter hook input priority 0; policy accept;
+
+        # Alle Interfaces ausser dem rohen LTE-Modem voll vertrauen
+        iifname != "wwan0" accept
+
+        # --- ab hier nur noch wwan0 ---
+        ct state established,related accept
+        ct state invalid drop
+        # DHCP-Client-Erneuerung zulassen, falls das Modem DHCP nutzt
+        udp sport 67 udp dport 68 accept
+        # Unaufgeforderter LTE-Eingang: still verwerfen (Stealth)
+        drop
+    }
+}

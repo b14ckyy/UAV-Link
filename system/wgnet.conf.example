@@ -1,0 +1,23 @@
+# /etc/wireguard/wgnet.conf — WireGuard client config for the air unit (EXAMPLE)
+#
+# The real file contains private keys and MUST NOT be committed (see .gitignore).
+# The Web-UI VPN panel writes this file from a pasted server-generated client config;
+# it strips DNS lines and pins the endpoint to the LTE interface automatically.
+#
+# Minimal generic form (no home-LAN policy routing — that is a bench-only extra):
+
+[Interface]
+Address = 10.192.1.1/24
+PrivateKey = <THIS DEVICE'S PRIVATE KEY>
+# DNS lines are stripped by the Web-UI so the tunnel does not hijack the Pi's resolver.
+
+[Peer]
+PublicKey = <WIREGUARD SERVER PUBLIC KEY>
+PresharedKey = <OPTIONAL PRESHARED KEY>
+Endpoint = <SERVER HOST OR IP>:51820
+AllowedIPs = 10.192.1.0/24
+PersistentKeepalive = 25
+
+# The endpoint host is additionally pinned to wwan0 in the NetworkManager profile
+# (nmcli connection modify uav-wwan ipv4.routes "<endpoint-ip>/32") so the tunnel
+# always runs over cellular even when Wi-Fi is up.

@@ -1,0 +1,7 @@
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-rtsp.service
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-msp.service
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/nmcli *
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/qmicli -d /dev/cdc-wdm0 --nas-get-signal-info -p
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/wg show *
+__UAVLINK_USER__ ALL=(root) NOPASSWD: __UAVLINK_DIR__/uav-wg-apply *
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-oled.service

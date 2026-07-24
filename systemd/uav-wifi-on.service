@@ -1,0 +1,11 @@
+[Unit]
+Description=UAV-Link safety net: force WiFi radio ON at boot
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "for i in 1 2 3 4 5 6; do nmcli radio wifi on && exit 0; sleep 3; done; exit 1"
+
+[Install]
+WantedBy=multi-user.target

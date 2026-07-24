@@ -1,0 +1,1092 @@
+#!/usr/bin/env python3
+"""UAV-Link web UI: video pipeline and WWAN configuration (port 8080)."""
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tempfile
+import threading
+import time
+
+from flask import (Flask, jsonify, redirect, render_template_string, request,
+                   send_file)
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE, 'config.json')
+PREVIEW_PATH = '/tmp/uav-preview.jpg'
+
+DEFAULTS = {
+    'device': 'auto', 'width': 720, 'height': 576, 'framerate': 50,
+    'bitrate_kbps': 2000, 'bitrate_mode': 'vbr', 'port': 8554, 'mount': '/cam',
+}
+MSP_DEFAULTS = {
+    'link': 'off', 'uart_device': '/dev/serial0', 'baud': 115200,
+    'udp_port': 5760, 'protocol': 'msp', 'inject_link_stats': True,
+    'poll_status': True, 'arm_wifi_off': False, 'arm_wifi_delay': 30,
+}
+MSP_BAUDS = [115200, 230400, 460800, 921600]
+OLED_DEFAULTS = {
+    'enabled': True, 'controller': 'ssd1306', 'address': '0x3C',
+    'width': 128, 'height': 64,
+}
+
+app = Flask(__name__)
+preview_lock = threading.Lock()
+preview_ts = 0.0
+
+# --- Auth: IP-basierte Session (keine Cookies), Default-Passwort, 10-min-Timeout ---
+AUTH_PATH = os.path.join(BASE, 'webui-auth.json')
+DEFAULT_PW = 'uavlink2026'
+SESSION_TIMEOUT = 600          # 10 min ohne Traffic -> Passwort wieder scharf
+AUTHED = {}                    # ip -> letzter Traffic (monotonic)
+
+
+def _hash_pw(pw, salt):
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, 100_000).hex()
+
+
+def load_auth():
+    try:
+        with open(AUTH_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def set_password(pw):
+    salt = os.urandom(16)
+    tmp = AUTH_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'salt': salt.hex(), 'hash': _hash_pw(pw, salt)}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, AUTH_PATH)   # atomar -> nie eine 0-Byte-Datei
+
+
+def verify_password(pw):
+    a = load_auth()
+    try:
+        return bool(a) and _hash_pw(pw, bytes.fromhex(a['salt'])) == a['hash']
+    except (KeyError, ValueError):
+        return False
+
+
+def is_default_password():
+    return verify_password(DEFAULT_PW)
+
+
+def ensure_auth():
+    """Legt das Default-Passwort an, wenn die Datei fehlt/korrupt ist.
+    -> Reset = Datei loeschen (self-healing zu Default)."""
+    if load_auth() is None:
+        set_password(DEFAULT_PW)
+
+
+ensure_auth()                  # Erststart
+
+
+def client_ip():
+    return request.remote_addr or ''
+
+
+def is_authed():
+    ip = client_ip()
+    ts = AUTHED.get(ip)
+    if ts is not None and time.monotonic() - ts < SESSION_TIMEOUT:
+        AUTHED[ip] = time.monotonic()      # Traffic haelt die Session offen
+        return True
+    return False
+
+
+def sh(cmd, timeout=15):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+
+def sysfs_name(dev):
+    try:
+        with open(f'/sys/class/video4linux/{os.path.basename(dev)}/name') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def video_devices():
+    devs = []
+    for dev in sorted(glob.glob('/dev/video*'),
+                      key=lambda d: int(re.sub(r'\D', '', d) or 999)):
+        name = sysfs_name(dev)
+        if 'bcm2835' in name or 'rpivid' in name:
+            continue
+        if 'MJPG' in sh(['v4l2-ctl', '-d', dev, '--list-formats']):
+            devs.append({'path': dev, 'name': name})
+    return devs
+
+
+def device_formats(dev):
+    """MJPG resolutions and framerates from v4l2 enumeration."""
+    out = sh(['v4l2-ctl', '-d', dev, '--list-formats-ext'])
+    formats, in_mjpg, size = [], False, None
+    for line in out.splitlines():
+        m = re.match(r"\s*\[\d+\]: '(\w+)'", line)
+        if m:
+            in_mjpg = m.group(1) == 'MJPG'
+            continue
+        if not in_mjpg:
+            continue
+        m = re.match(r'\s*Size: Discrete (\d+)x(\d+)', line)
+        if m:
+            size = {'width': int(m.group(1)), 'height': int(m.group(2)),
+                    'fps': []}
+            formats.append(size)
+            continue
+        m = re.match(r'\s*Interval: Discrete [\d.]+s \(([\d.]+) fps\)', line)
+        if m and size is not None:
+            fps = round(float(m.group(1)))
+            if fps not in size['fps']:
+                size['fps'].append(fps)
+    return [f for f in formats if f['fps']]
+
+
+def modem_info():
+    out = sh(['mmcli', '-m', 'a', '--output-keyvalue'])
+    kv = {}
+    for line in out.splitlines():
+        if ' : ' in line:
+            k, v = line.split(' : ', 1)
+            kv[k.strip()] = v.strip()
+    sig = sh(['sudo', 'qmicli', '-d', '/dev/cdc-wdm0',
+              '--nas-get-signal-info', '-p'])
+
+    def grab(pat):
+        m = re.search(pat + r": '([^']+)'", sig)
+        return m.group(1) if m else '?'
+
+    ip_out = sh(['ip', '-4', '-o', 'addr', 'show', 'wwan0'])
+    ip_match = re.search(r'inet (\S+)', ip_out)
+    return {
+        'state': kv.get('modem.generic.state', 'no modem'),
+        'operator': kv.get('modem.3gpp.operator-name', '?'),
+        'tech': kv.get('modem.generic.access-technologies.value[1]', '?'),
+        'quality': kv.get('modem.generic.signal-quality.value', '?'),
+        'rsrp': grab('RSRP'), 'rsrq': grab('RSRQ'), 'snr': grab('SNR'),
+        'apn': sh(['nmcli', '-g', 'gsm.apn', 'connection', 'show',
+                   'uav-wwan']),
+        'username': sh(['nmcli', '-g', 'gsm.username', 'connection', 'show',
+                        'uav-wwan']),
+        'wwan_ip': ip_match.group(1) if ip_match else '',
+    }
+
+
+def msp_config(cfg):
+    m = dict(MSP_DEFAULTS)
+    m.update(cfg.get('msp') or {})
+    return m
+
+
+def oled_config(cfg):
+    o = dict(OLED_DEFAULTS)
+    o.update(cfg.get('oled') or {})
+    return o
+
+
+def wg_ip():
+    m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)',
+                  sh(['ip', '-4', '-o', 'addr', 'show', 'wgnet']))
+    return m.group(1) if m else ''
+
+
+def wg_status():
+    out = sh(['sudo', 'wg', 'show', 'wgnet'])
+    st = {'up': bool(out), 'endpoint': '', 'handshake': '', 'transfer': '',
+          'address': wg_ip()}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('endpoint:'):
+            st['endpoint'] = line.split(':', 1)[1].strip()
+        elif line.startswith('latest handshake:'):
+            st['handshake'] = line.split(':', 1)[1].strip()
+        elif line.startswith('transfer:'):
+            st['transfer'] = line.split(':', 1)[1].strip()
+    return st
+
+
+HOTSPOT = 'uav-hotspot'
+RESERVED_CONNS = {HOTSPOT, 'uav-wwan'}
+
+
+def wifi_status():
+    """(ap_active, verbundene SSID/Profilname) fuer wlan0."""
+    for line in sh(['nmcli', '-t', '-f', 'DEVICE,STATE,CONNECTION',
+                    'device']).splitlines():
+        parts = line.split(':')
+        if parts[0] == 'wlan0' and len(parts) >= 3 and parts[1] == 'connected':
+            if parts[2] == HOTSPOT:
+                return True, ''
+            return False, parts[2]
+    return False, ''
+
+
+def wifi_networks():
+    nets = []
+    for line in sh(['nmcli', '-t', '-f', 'NAME,TYPE',
+                    'connection', 'show']).splitlines():
+        name, _, typ = line.rpartition(':')
+        if typ == '802-11-wireless' and name not in RESERVED_CONNS:
+            nets.append(name)
+    return nets
+
+
+def hotspot_pw_default():
+    psk = sh(['sudo', 'nmcli', '-s', '-g', '802-11-wireless-security.psk',
+              'connection', 'show', HOTSPOT]).strip()
+    return psk in ('', 'uavlink2026')
+
+
+def net_counters():
+    counters = {}
+    try:
+        with open('/proc/net/dev') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                name, rest = line.split(':', 1)
+                name = name.strip()
+                if name in ('wwan0', 'wlan0'):
+                    fields = rest.split()
+                    counters[name] = {'rx': int(fields[0]),
+                                      'tx': int(fields[8])}
+    except OSError:
+        pass
+    return counters
+
+
+TEMPLATE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UAV-Link</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #14181c; color: #d8dde2;
+         max-width: 680px; margin: 2em auto; padding: 0 1em; }
+  h1 { font-size: 1.4em; } h2 { font-size: 1.05em; margin-top: 1.6em;
+       border-bottom: 1px solid #2a323a; padding-bottom: .3em; }
+  .card { background: #1b2127; border: 1px solid #2a323a; border-radius: 8px;
+          padding: 1em 1.2em; margin: 1em 0; }
+  label { display: block; margin: .6em 0 .15em; font-size: .85em; color: #9aa5af; }
+  input, select { width: 100%; box-sizing: border-box; padding: .45em;
+          background: #12161a; color: #d8dde2; border: 1px solid #35404a;
+          border-radius: 5px; }
+  .row { display: flex; gap: .8em; } .row > div { flex: 1; }
+  button { margin-top: 1em; padding: .55em 1.4em; background: #2f6fb3;
+           color: #fff; border: 0; border-radius: 5px; cursor: pointer; }
+  button:hover { background: #3a82cf; }
+  button.secondary { background: #2a323a; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: .2em 1em;
+        font-size: .9em; }
+  .kv span:nth-child(odd) { color: #9aa5af; }
+  .ok { color: #6fc276; } .bad { color: #e07a5f; }
+  .url { font-family: monospace; background: #12161a; padding: .3em .5em;
+         border-radius: 4px; display: inline-block; }
+  .hint { font-size: .78em; color: #7c8791; margin-top: .2em; }
+  #preview-img { width: 100%; border-radius: 6px; margin-top: .8em;
+                 display: none; background: #000; }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr);
+               gap: .8em; text-align: center; }
+  .stat { background: #12161a; border-radius: 6px; padding: .6em .3em; }
+  .stat b { font-size: 1.15em; display: block; }
+  .stat span { font-size: .72em; color: #7c8791; }
+</style></head><body>
+<h1>UAV-Link</h1>
+
+<style>
+  .warn { background: #4a1c1c; border: 1px solid #e07a5f; color: #ffd9cf;
+          padding: .7em 1em; border-radius: 6px; margin: .7em 0; }
+  .warn form { display: flex; gap: .5em; margin-top: .5em; }
+  .warn input { margin: 0; }
+</style>
+{% if default_pw %}
+<div class="warn">
+  <b>&#9888; Default password active</b> — change it now (also change the Wi-Fi
+  hotspot password below).
+  <form method="post" action="/passwd" onsubmit="return pwMatch(this,'new_password')">
+    <input name="new_password" type="password" placeholder="new UI password"
+           minlength="4" required>
+    <input name="confirm" type="password" placeholder="repeat password"
+           minlength="4" required>
+    <button type="submit">Change</button>
+  </form>
+</div>
+{% endif %}
+{% if ap_pw_warn %}
+<div class="warn">
+  <b>&#9888; Access-point mode with default Wi-Fi password</b> — change the hotspot
+  password in the Wi-Fi section below.
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="kv">
+    <span>RTSP stream</span>
+    <span class="url">rtsp://{{ host }}:{{ cfg.port }}{{ cfg.mount }}</span>
+    <span>Video service</span>
+    <span class="{{ 'ok' if rtsp_active else 'bad' }}">
+      {{ 'running' if rtsp_active else 'stopped' }}</span>
+  </div>
+  <button type="button" class="secondary" id="preview-btn"
+          onclick="togglePreview()">Start preview</button>
+  <img id="preview-img" alt="stream preview">
+  <div class="hint" id="preview-hint"></div>
+</div>
+
+<h2>System</h2>
+<div class="card">
+  <div class="stat-grid">
+    <div class="stat"><b id="st-cpu">–</b><span>CPU load</span></div>
+    <div class="stat"><b id="st-temp">–</b><span>SoC temp</span></div>
+    <div class="stat"><b id="st-ram">–</b><span>RAM used</span></div>
+    <div class="stat"><b id="st-wwan">–</b><span>4G Rx / Tx</span></div>
+    <div class="stat"><b id="st-wlan">–</b><span>WiFi Rx / Tx</span></div>
+    <div class="stat"><b id="st-sig">{{ modem.quality }} %</b>
+      <span>signal</span></div>
+    <div class="stat"><b id="st-pwr">–</b><span>supply voltage</span></div>
+  </div>
+</div>
+
+<h2>Video</h2>
+<div class="card"><form method="post" action="/save">
+  <label>Device</label>
+  <select name="device" id="device" onchange="loadFormats()">
+    {% for d in devices %}
+    <option value="{{ d.path }}" {{ 'selected' if cfg.device == d.path }}>
+      {{ d.path }} — {{ d.name }}</option>
+    {% endfor %}
+    <option value="auto" {{ 'selected' if cfg.device == 'auto' }}>
+      auto (first MJPG capture device)</option>
+  </select>
+  <div class="row">
+    <div><label>Resolution</label>
+      <select name="resolution" id="resolution"
+              onchange="updateFps()"></select></div>
+    <div><label>Frame rate</label>
+      <select name="framerate" id="framerate"></select></div>
+  </div>
+  <div class="row">
+    <div><label>Bitrate</label>
+      <select name="bitrate_kbps">
+        {% for kbps in bitrates %}
+        <option value="{{ kbps }}" {{ 'selected' if cfg.bitrate_kbps == kbps }}>
+          {{ '%.1f'|format(kbps / 1000) }} Mbit/s</option>
+        {% endfor %}
+      </select></div>
+    <div><label>Rate control</label>
+      <select name="bitrate_mode">
+        <option value="vbr" {{ 'selected' if cfg.bitrate_mode == 'vbr' }}>VBR (recommended)</option>
+        <option value="cbr" {{ 'selected' if cfg.bitrate_mode == 'cbr' }}>CBR</option>
+      </select></div>
+  </div>
+  <div class="hint">Note: CBR throttles the HW encoder to ~38 fps (measured) — testing only.</div>
+  <div class="row">
+    <div><label>RTSP port</label>
+      <input name="port" type="number" value="{{ cfg.port }}"></div>
+    <div><label>Mount path</label>
+      <input name="mount" value="{{ cfg.mount }}"></div>
+  </div>
+  <button type="submit">Save &amp; restart pipeline</button>
+</form></div>
+
+<h2>Cellular (WWAN)</h2>
+<div class="card">
+  <div class="kv">
+    <span>Status</span><span>{{ modem.state }}</span>
+    <span>Network</span><span>{{ modem.operator }} ({{ modem.tech }})</span>
+    <span>Signal</span><span>{{ modem.quality }} % — RSRP {{ modem.rsrp }},
+      RSRQ {{ modem.rsrq }}, SNR {{ modem.snr }}</span>
+    <span>IP (wwan0)</span><span>{{ modem.wwan_ip or 'not connected' }}</span>
+  </div>
+  <form method="post" action="/apn">
+    <label>APN (empty = modem default bearer)</label>
+    <input name="apn" value="{{ modem.apn }}"
+           placeholder="empty = use modem default">
+    <div class="row">
+      <div><label>Username (optional)</label>
+        <input name="username" value="{{ modem.username }}"></div>
+      <div><label>Password (optional)</label>
+        <input name="password" type="password" placeholder="unchanged"></div>
+    </div>
+    <div class="row">
+      <div><label>SIM PIN (empty = unchanged)</label>
+        <input name="pin" type="password" maxlength="8"
+               placeholder="only for locked SIMs"></div>
+      <div><label>&nbsp;</label>
+        <label style="display:flex;align-items:center;gap:.5em;margin:0">
+          <input type="checkbox" name="clear_pin" value="1"
+                 style="width:auto"> clear stored PIN</label></div>
+    </div>
+    <div class="hint">Tip: an empty APN uses the modem's default bearer — try
+      this first. If the modem sticks at "registered" with an explicit APN,
+      clear the APN field (some networks reject a second PDN with the same
+      name). Leave username empty to clear credentials. A stored SIM PIN is
+      used to unlock the SIM automatically on connect.</div>
+    <button type="submit">Save APN &amp; reconnect</button>
+  </form>
+</div>
+
+<h2>Wi-Fi</h2>
+<div class="card">
+  <div class="kv">
+    <span>Radio</span>
+    <span class="{{ 'ok' if wifi_on else 'bad' }}">
+      {{ 'enabled' if wifi_on else 'disabled (until reboot)' }}</span>
+    <span>Mode</span>
+    <span>{% if ap_active %}<b class="ok">access point</b> — SSID "UAV-Link",
+      page at http://10.42.0.1:8080{% elif wifi_ssid %}client — {{ wifi_ssid }}
+      {% else %}not connected{% endif %}</span>
+  </div>
+  <div class="row">
+    <div>
+      <form method="post" action="/wifi" id="wifi-form" onsubmit="return confirmWifi();">
+        <input type="hidden" name="action" value="{{ 'off' if wifi_on else 'on' }}">
+        <button type="submit" class="{{ 'secondary' if wifi_on else '' }}">
+          {{ 'Disable Wi-Fi (runtime only)' if wifi_on else 'Enable Wi-Fi' }}</button>
+      </form>
+    </div>
+    <div>
+      <form method="post" action="/wifi">
+        <input type="hidden" name="action" value="{{ 'ap_off' if ap_active else 'ap_on' }}">
+        <button type="submit" class="secondary">
+          {{ 'Stop access point' if ap_active else 'Start access point' }}</button>
+      </form>
+    </div>
+  </div>
+  <div class="hint">Safety net: Wi-Fi is forced back ON at every boot.
+    Fallback: if no known network connects within 60 s after boot or radio-on,
+    the Pi starts access point <b>UAV-Link</b> (WPA2, password <b>uavlink2026</b>,
+    page at http://10.42.0.1:8080). Holding GPIO21 (pin 40) to GND (pin 39) for
+    3 s starts it manually. VPN over LTE stays active in every mode.
+    Disabling Wi-Fi drops LAN access — continue on <b>http://10.192.1.1:8080</b>.</div>
+  <form method="post" action="/hotspot_pw" onsubmit="return pwMatch(this,'psk')">
+    <label>Access-point (hotspot) password</label>
+    <div class="row">
+      <div><input name="psk" type="password" minlength="8" maxlength="63"
+             placeholder="new hotspot password (min 8)"></div>
+      <div><input name="confirm" type="password" minlength="8" maxlength="63"
+             placeholder="repeat"></div>
+    </div>
+    <button type="submit" class="secondary">Change hotspot password</button>
+  </form>
+</div>
+
+<h2>Known Wi-Fi Networks</h2>
+<div class="card">
+  {% if wifi_nets %}
+  <table style="width:100%;border-collapse:collapse">
+    {% for n in wifi_nets %}
+    <tr style="border-bottom:1px solid #2a323a">
+      <td style="padding:.35em .4em">{{ n }}{% if n == wifi_ssid %}
+        <span class="ok">(connected)</span>{% endif %}</td>
+      <td style="padding:.35em .4em;text-align:right">
+        <form method="post" action="/wifi_net" style="display:inline"
+              onsubmit="return confirm('Remove network {{ n }}?');">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="name" value="{{ n }}">
+          <button type="submit" class="secondary"
+                  style="margin:0;padding:.25em .7em">Remove</button>
+        </form></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="hint">No saved networks.</div>
+  {% endif %}
+  <form method="post" action="/wifi_net">
+    <input type="hidden" name="action" value="add">
+    <div class="row">
+      <div><label>SSID</label><input name="ssid" maxlength="32"></div>
+      <div><label>Password (WPA2, empty = open)</label>
+        <input name="password" type="password" maxlength="63"></div>
+    </div>
+    <button type="submit">Add network</button>
+  </form>
+  <div class="hint">The Pi auto-connects to any saved network in range.</div>
+</div>
+
+<h2>VPN (WireGuard)</h2>
+<div class="card">
+  <div class="kv">
+    <span>Tunnel</span>
+    <span class="{{ 'ok' if wg.handshake and 'ago' in wg.handshake else 'bad' }}">
+      {{ 'up' if wg.up else 'not configured' }}</span>
+    <span>VPN IP</span><span>{{ wg.address or '–' }}</span>
+    <span>Endpoint</span><span>{{ wg.endpoint or '–' }}</span>
+    <span>Last handshake</span><span>{{ wg.handshake or 'never' }}</span>
+    <span>Transfer</span><span>{{ wg.transfer or '–' }}</span>
+  </div>
+  <form method="post" action="/wg"
+        onsubmit="return confirm('Replace the current tunnel config? The old one is backed up.');">
+    <label>Upload a .conf file, or paste it below</label>
+    <input type="file" accept=".conf,text/plain" onchange="loadWgFile(this)"
+           style="margin-bottom:.4em">
+    <label>Client config (paste the .conf from your WireGuard server)</label>
+    <textarea name="config" rows="9" spellcheck="false"
+      style="width:100%;box-sizing:border-box;padding:.45em;background:#12161a;
+             color:#d8dde2;border:1px solid #35404a;border-radius:5px;
+             font-family:monospace;font-size:.82em;resize:vertical"
+      placeholder="[Interface]&#10;PrivateKey = ...&#10;Address = ...&#10;&#10;[Peer]&#10;PublicKey = ...&#10;Endpoint = host:51820&#10;AllowedIPs = ..."></textarea>
+    <button type="submit">Apply config &amp; restart tunnel</button>
+  </form>
+  <div class="hint">Replaces the current tunnel (previous config is backed up on
+    the Pi). The peer endpoint is automatically pinned to the LTE interface, so
+    the tunnel always runs over cellular even when Wi-Fi is up. Paste the config
+    your WireGuard server generated for this device.</div>
+</div>
+
+<h2>Flight Controller (MSP)</h2>
+<div class="card">
+  <div class="kv">
+    <span>Bridge service</span>
+    <span class="{{ 'ok' if msp_active else 'bad' }}">
+      {{ 'running' if msp_active else 'stopped' }}</span>
+    <span>GCS endpoint</span>
+    <span class="url">udp://{{ vpn_ip or host }}:{{ msp.udp_port }}</span>
+  </div>
+  <form method="post" action="/msp">
+    <div class="row">
+      <div><label>FC link</label>
+        <select name="link">
+          <option value="off" {{ 'selected' if msp.link == 'off' }}>disabled</option>
+          <option value="uart" {{ 'selected' if msp.link == 'uart' }}>UART (GPIO 14/15)</option>
+          <option value="usb" {{ 'selected' if msp.link == 'usb' }}>USB VCP (auto /dev/ttyACM*)</option>
+        </select></div>
+      <div><label>Baud rate (UART)</label>
+        <select name="baud">
+          {% for b in msp_bauds %}
+          <option value="{{ b }}" {{ 'selected' if msp.baud == b }}>{{ b }}</option>
+          {% endfor %}
+        </select></div>
+    </div>
+    <div class="row">
+      <div><label>Protocol</label>
+        <select name="protocol">
+          <option value="msp" {{ 'selected' if msp.protocol == 'msp' }}>MSP (INAV)</option>
+          <option value="mavlink" {{ 'selected' if msp.protocol == 'mavlink' }}>MAVLink (ArduPilot/PX4)</option>
+        </select></div>
+      <div><label>UDP port</label>
+        <input name="udp_port" type="number" value="{{ msp.udp_port }}"></div>
+    </div>
+    <div class="row">
+      <div><label>LTE telemetry injection</label>
+        <select name="inject">
+          <option value="on" {{ 'selected' if msp.inject_link_stats }}>on (RSSI/SNR → OSD/GCS)</option>
+          <option value="off" {{ 'selected' if not msp.inject_link_stats }}>off</option>
+        </select></div>
+      <div><label>Disable Wi-Fi when armed</label>
+        <select name="arm_wifi_off">
+          <option value="off" {{ 'selected' if not msp.arm_wifi_off }}>off</option>
+          <option value="on" {{ 'selected' if msp.arm_wifi_off }}>on (after {{ msp.arm_wifi_delay }} s, LTE stays)</option>
+        </select></div>
+    </div>
+    <div class="hint">Configure the FC port for the selected protocol at the same baud
+      (INAV: Ports → MSP; ArduPilot: SERIALn_PROTOCOL = MAVLink). Cellular link stats
+      are injected as RC link telemetry (MSP: RC_LINK_STATS, MAVLink: RADIO_STATUS).
+      "Disable Wi-Fi when armed" cuts Wi-Fi {{ msp.arm_wifi_delay }} s after arming
+      (LTE/VPN stay up) — the bridge reads the arm state passively; it never polls the
+      FC while a GCS is connected.</div>
+    <button type="submit">Save &amp; restart bridge</button>
+  </form>
+</div>
+
+<h2>Status Display (OLED)</h2>
+<div class="card"><form method="post" action="/oled">
+  <div class="row">
+    <div><label>Display</label>
+      <select name="enabled">
+        <option value="on" {{ 'selected' if oled.enabled }}>enabled</option>
+        <option value="off" {{ 'selected' if not oled.enabled }}>disabled</option>
+      </select></div>
+    <div><label>Controller</label>
+      <select name="controller">
+        <option value="ssd1306" {{ 'selected' if oled.controller == 'ssd1306' }}>SSD1306 (0.96")</option>
+        <option value="sh1106" {{ 'selected' if oled.controller == 'sh1106' }}>SH1106 (1.3")</option>
+      </select></div>
+    <div><label>I2C address</label>
+      <select name="address">
+        <option value="0x3C" {{ 'selected' if oled.address == '0x3C' }}>0x3C</option>
+        <option value="0x3D" {{ 'selected' if oled.address == '0x3D' }}>0x3D</option>
+      </select></div>
+  </div>
+  <div class="hint">128&times;64 I2C OLED on GPIO2/3 (pins 3/5, GND pin 6). Pick SH1106
+    for 1.3" panels — avoids the 2&#8209;pixel shift / scrambled rows. Needs I2C enabled
+    (active after the next reboot on first setup).</div>
+  <button type="submit">Save &amp; restart display</button>
+</form></div>
+
+<script>
+const CUR = { res: "{{ cfg.width }}x{{ cfg.height }}",
+              fps: "{{ cfg.framerate }}" };
+let formats = [];
+
+function loadFormats() {
+  const dev = document.getElementById('device').value;
+  fetch('/api/formats?device=' + encodeURIComponent(dev))
+    .then(r => r.json())
+    .then(data => {
+      formats = data.formats || [];
+      const rsel = document.getElementById('resolution');
+      rsel.innerHTML = '';
+      let found = false;
+      for (const f of formats) {
+        const val = f.width + 'x' + f.height;
+        const opt = new Option(val, val, false, val === CUR.res);
+        rsel.add(opt);
+        if (val === CUR.res) found = true;
+      }
+      if (!found && CUR.res !== 'x') {
+        rsel.add(new Option(CUR.res + ' (current)', CUR.res, false, true));
+      }
+      updateFps();
+    })
+    .catch(() => {});
+}
+
+function updateFps() {
+  const rsel = document.getElementById('resolution');
+  const fsel = document.getElementById('framerate');
+  fsel.innerHTML = '';
+  const f = formats.find(x => x.width + 'x' + x.height === rsel.value);
+  const rates = f ? f.fps.slice().sort((a, b) => b - a) : [];
+  let found = false;
+  for (const r of rates) {
+    fsel.add(new Option(r + ' fps', r, false, String(r) === CUR.fps));
+    if (String(r) === CUR.fps) found = true;
+  }
+  if (!found && CUR.fps) {
+    fsel.add(new Option(CUR.fps + ' fps (current)', CUR.fps, false, true));
+  }
+}
+
+function pwMatch(f, name) {
+  if (f[name].value !== f.confirm.value) {
+    alert('Passwords do not match.');
+    return false;
+  }
+  return true;
+}
+
+function loadWgFile(input) {
+  const f = input.files && input.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = e => {
+    const ta = document.querySelector('textarea[name=config]');
+    if (ta) ta.value = e.target.result;
+  };
+  r.readAsText(f);
+}
+
+function confirmWifi() {
+  const act = document.querySelector('#wifi-form input[name=action]').value;
+  if (act === 'off') {
+    return confirm('Disable Wi-Fi until the next reboot?\\n' +
+                   'This page stays reachable at http://10.192.1.1:8080 (VPN/LTE).');
+  }
+  return true;
+}
+
+let prev = null;
+function fmtRate(bps) {
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' Mbit/s';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' kbit/s';
+  return bps.toFixed(0) + ' bit/s';
+}
+function pollStats() {
+  fetch('/api/stats').then(r => r.json()).then(s => {
+    document.getElementById('st-temp').textContent =
+      s.temp_c.toFixed(1) + ' °C';
+    document.getElementById('st-ram').textContent =
+      Math.round((1 - s.mem_avail / s.mem_total) * 100) + ' %';
+    const pwr = document.getElementById('st-pwr');
+    if (s.throttled & 0x1) {
+      pwr.textContent = 'LOW NOW!'; pwr.className = 'bad';
+    } else if (s.throttled & 0x10000) {
+      pwr.textContent = 'was low'; pwr.className = 'bad';
+    } else {
+      pwr.textContent = 'OK'; pwr.className = 'ok';
+    }
+    if (prev) {
+      const dt = (s.ts - prev.ts) || 1;
+      const busy = (s.cpu.total - prev.cpu.total) -
+                   (s.cpu.idle - prev.cpu.idle);
+      const pct = 100 * busy / ((s.cpu.total - prev.cpu.total) || 1);
+      document.getElementById('st-cpu').textContent =
+        Math.max(0, pct).toFixed(0) + ' %';
+      for (const [iface, el] of [['wwan0', 'st-wwan'], ['wlan0', 'st-wlan']]) {
+        if (s.net[iface] && prev.net[iface]) {
+          const rx = 8 * (s.net[iface].rx - prev.net[iface].rx) / dt;
+          const tx = 8 * (s.net[iface].tx - prev.net[iface].tx) / dt;
+          document.getElementById(el).textContent =
+            fmtRate(rx) + ' / ' + fmtRate(tx);
+        } else {
+          document.getElementById(el).textContent = 'down';
+        }
+      }
+    }
+    prev = s;
+  }).catch(() => {});
+}
+
+let previewTimer = null;
+function togglePreview() {
+  const img = document.getElementById('preview-img');
+  const btn = document.getElementById('preview-btn');
+  const hint = document.getElementById('preview-hint');
+  if (previewTimer) {
+    clearInterval(previewTimer); previewTimer = null;
+    img.style.display = 'none'; btn.textContent = 'Start preview';
+    hint.textContent = '';
+    return;
+  }
+  btn.textContent = 'Stop preview';
+  hint.textContent = 'Grabbing frames from the RTSP stream (approx. one per 3 s)...';
+  const refresh = () => {
+    const probe = new Image();
+    probe.onload = () => { img.src = probe.src; img.style.display = 'block';
+                           hint.textContent = ''; };
+    probe.onerror = () => { hint.textContent =
+      'No frame available (stream idle or no input signal).'; };
+    probe.src = '/preview.jpg?ts=' + Date.now();
+  };
+  refresh();
+  previewTimer = setInterval(refresh, 3000);
+}
+
+loadFormats();
+pollStats();
+setInterval(pollStats, 2000);
+</script>
+</body></html>"""
+
+
+LOGIN_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UAV-Link — Login</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #14181c; color: #d8dde2;
+         max-width: 340px; margin: 6em auto; padding: 0 1em; text-align: center; }
+  h1 { font-size: 1.3em; } input { width: 100%; box-sizing: border-box; padding: .6em;
+       margin: .6em 0; background: #12161a; color: #d8dde2; border: 1px solid #35404a;
+       border-radius: 5px; }
+  button { padding: .6em 1.6em; background: #2f6fb3; color: #fff; border: 0;
+           border-radius: 5px; cursor: pointer; }
+  .err { color: #e07a5f; font-size: .9em; }
+</style></head><body>
+<h1>UAV-Link</h1>
+<form method="post" action="/login">
+  <input name="password" type="password" placeholder="password" autofocus>
+  <button type="submit">Log in</button>
+  {% if err %}<div class="err">Wrong password.</div>{% endif %}
+</form>
+</body></html>"""
+
+
+@app.before_request
+def _require_auth():
+    ensure_auth()              # geloeschte Auth-Datei -> Default (Reset self-heal)
+    if request.path == '/login' or request.path.startswith('/static'):
+        return None
+    if not is_authed():
+        return render_template_string(LOGIN_TEMPLATE, err=False)
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if verify_password(request.form.get('password', '')):
+            AUTHED[client_ip()] = time.monotonic()
+            return redirect('/')
+        return render_template_string(LOGIN_TEMPLATE, err=True)
+    if is_authed():
+        return redirect('/')
+    return render_template_string(LOGIN_TEMPLATE, err=False)
+
+
+@app.route('/passwd', methods=['POST'])
+def passwd():
+    new = request.form.get('new_password', '')
+    confirm = request.form.get('confirm', '')
+    if is_authed() and 4 <= len(new) <= 64 and new == confirm:
+        set_password(new)
+    return redirect('/')
+
+
+@app.route('/hotspot_pw', methods=['POST'])
+def hotspot_pw():
+    psk = request.form.get('psk', '')
+    confirm = request.form.get('confirm', '')
+    if is_authed() and 8 <= len(psk) <= 63 and psk == confirm:
+        sh(['sudo', 'nmcli', 'connection', 'modify', HOTSPOT,
+            'wifi-sec.psk', psk])
+    return redirect('/')
+
+
+@app.route('/')
+def index():
+    cfg = load_config()
+    return render_template_string(
+        TEMPLATE, cfg=cfg, devices=video_devices(),
+        modem=modem_info(), host=request.host.split(':')[0],
+        bitrates=list(range(1000, 5001, 500)),
+        msp=msp_config(cfg), msp_bauds=MSP_BAUDS, vpn_ip=wg_ip(),
+        oled=oled_config(cfg), default_pw=is_default_password(),
+        ap_pw_warn=(wifi_status()[0] and hotspot_pw_default()),
+        wifi_on=sh(['nmcli', 'radio', 'wifi']) == 'enabled',
+        ap_active=wifi_status()[0], wifi_ssid=wifi_status()[1],
+        wifi_nets=wifi_networks(), wg=wg_status(),
+        rtsp_active=sh(['systemctl', 'is-active', 'uav-rtsp']) == 'active',
+        msp_active=sh(['systemctl', 'is-active', 'uav-msp']) == 'active')
+
+
+@app.route('/api/formats')
+def api_formats():
+    dev = request.args.get('device', 'auto')
+    if dev == 'auto':
+        devs = video_devices()
+        dev = devs[0]['path'] if devs else ''
+    if not re.fullmatch(r'/dev/video\d+', dev or ''):
+        return jsonify({'formats': []})
+    return jsonify({'formats': device_formats(dev)})
+
+
+@app.route('/api/stats')
+def api_stats():
+    temp = 0.0
+    try:
+        with open('/sys/class/thermal/thermal_zone0/temp') as f:
+            temp = int(f.read().strip()) / 1000.0
+    except (OSError, ValueError):
+        pass
+    mem_total = mem_avail = 0
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    mem_total = int(line.split()[1])
+                elif line.startswith('MemAvailable:'):
+                    mem_avail = int(line.split()[1])
+    except OSError:
+        pass
+    cpu = {'total': 0, 'idle': 0}
+    try:
+        with open('/proc/stat') as f:
+            fields = [int(x) for x in f.readline().split()[1:]]
+        cpu = {'total': sum(fields), 'idle': fields[3] + fields[4]}
+    except (OSError, ValueError, IndexError):
+        pass
+    m = re.search(r'0x([0-9a-fA-F]+)', sh(['vcgencmd', 'get_throttled']))
+    throttled = int(m.group(1), 16) if m else 0
+    return jsonify({'ts': time.time(), 'temp_c': temp, 'cpu': cpu,
+                    'mem_total': mem_total or 1, 'mem_avail': mem_avail,
+                    'net': net_counters(), 'throttled': throttled})
+
+
+@app.route('/preview.jpg')
+def preview():
+    global preview_ts
+    cfg = load_config()
+    with preview_lock:
+        if time.time() - preview_ts > 2.0:
+            try:
+                os.unlink(PREVIEW_PATH)
+            except OSError:
+                pass
+            url = f"rtsp://127.0.0.1:{cfg['port']}{cfg['mount']}"
+            subprocess.run(
+                ['gst-launch-1.0', '-q', 'rtspsrc', f'location={url}',
+                 'latency=0', 'protocols=udp', '!', 'rtph264depay', '!',
+                 'h264parse', '!', 'avdec_h264', '!', 'videoconvert', '!',
+                 'jpegenc', 'snapshot=true', '!', 'filesink',
+                 f'location={PREVIEW_PATH}'],
+                capture_output=True, timeout=10, check=False)
+            preview_ts = time.time()
+    if os.path.exists(PREVIEW_PATH) and os.path.getsize(PREVIEW_PATH) > 0:
+        resp = send_file(PREVIEW_PATH, mimetype='image/jpeg')
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+    return ('no frame', 503)
+
+
+@app.route('/save', methods=['POST'])
+def save():
+    cfg = load_config()
+    device = request.form.get('device', 'auto')
+    if device == 'auto' or re.fullmatch(r'/dev/video\d+', device):
+        cfg['device'] = device
+    res = request.form.get('resolution', '')
+    m = re.fullmatch(r'(\d{2,4})x(\d{2,4})', res)
+    if m:
+        cfg['width'], cfg['height'] = int(m.group(1)), int(m.group(2))
+    mount = request.form.get('mount', '').strip().lstrip('/')
+    if re.fullmatch(r'[A-Za-z0-9_\-]+', mount):
+        cfg['mount'] = '/' + mount
+    cfg['bitrate_mode'] = ('cbr' if request.form.get('bitrate_mode') == 'cbr'
+                           else 'vbr')
+    for key in ('framerate', 'bitrate_kbps', 'port'):
+        try:
+            val = int(request.form.get(key, DEFAULTS[key]))
+        except ValueError:
+            val = DEFAULTS[key]
+        cfg[key] = val if 0 < val <= 65535 else DEFAULTS[key]
+    save_config(cfg)
+    sh(['sudo', 'systemctl', 'restart', 'uav-rtsp.service'], timeout=30)
+    return redirect('/')
+
+
+@app.route('/wifi', methods=['POST'])
+def wifi():
+    action = request.form.get('action', '')
+    if action in ('on', 'off'):
+        sh(['sudo', 'nmcli', 'radio', 'wifi', action], timeout=20)
+    elif action == 'ap_on':
+        sh(['sudo', 'nmcli', 'radio', 'wifi', 'on'], timeout=20)
+        sh(['sudo', 'nmcli', 'connection', 'up', HOTSPOT], timeout=60)
+    elif action == 'ap_off':
+        sh(['sudo', 'nmcli', 'connection', 'down', HOTSPOT], timeout=60)
+    return redirect('/')
+
+
+@app.route('/wifi_net', methods=['POST'])
+def wifi_net():
+    action = request.form.get('action', '')
+    if action == 'add':
+        ssid = request.form.get('ssid', '').strip()
+        password = request.form.get('password', '')
+        if 0 < len(ssid) <= 32 and (not password or 8 <= len(password) <= 63):
+            args = ['sudo', 'nmcli', 'connection', 'add', 'type', 'wifi',
+                    'ifname', 'wlan0', 'con-name', ssid, 'ssid', ssid,
+                    'connection.autoconnect', 'yes']
+            if password:
+                args += ['wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', password]
+            sh(args)
+    elif action == 'delete':
+        name = request.form.get('name', '')
+        if name in wifi_networks():   # nur echte WLAN-Profile, nie uav-wwan/hotspot
+            sh(['sudo', 'nmcli', 'connection', 'delete', name])
+    return redirect('/')
+
+
+@app.route('/wg', methods=['POST'])
+def wg_apply():
+    config = request.form.get('config', '')
+    if ('[Interface]' in config and '[Peer]' in config
+            and 'PrivateKey' in config and len(config) < 8192):
+        fd, path = tempfile.mkstemp(prefix='uav-wg-', suffix='.conf')
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(config)
+            os.chmod(path, 0o600)
+            sh(['sudo', os.path.join(BASE, 'uav-wg-apply'), path], timeout=45)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    return redirect('/')
+
+
+@app.route('/oled', methods=['POST'])
+def oled_save():
+    cfg = load_config()
+    o = oled_config(cfg)
+    o['enabled'] = request.form.get('enabled') == 'on'
+    ctrl = request.form.get('controller', 'ssd1306')
+    if ctrl in ('ssd1306', 'sh1106'):
+        o['controller'] = ctrl
+    addr = request.form.get('address', '0x3C')
+    if addr in ('0x3C', '0x3D'):
+        o['address'] = addr
+    cfg['oled'] = o
+    save_config(cfg)
+    sh(['sudo', 'systemctl', 'restart', 'uav-oled.service'], timeout=15)
+    return redirect('/')
+
+
+@app.route('/msp', methods=['POST'])
+def msp_save():
+    cfg = load_config()
+    m = msp_config(cfg)
+    link = request.form.get('link', 'off')
+    if link in ('off', 'uart', 'usb'):
+        m['link'] = link
+    try:
+        baud = int(request.form.get('baud', 115200))
+    except ValueError:
+        baud = 115200
+    if baud in MSP_BAUDS:
+        m['baud'] = baud
+    proto = request.form.get('protocol', 'msp')
+    if proto in ('msp', 'mavlink'):
+        m['protocol'] = proto
+    try:
+        port = int(request.form.get('udp_port', 5760))
+    except ValueError:
+        port = 5760
+    if 0 < port <= 65535:
+        m['udp_port'] = port
+    m['inject_link_stats'] = request.form.get('inject') == 'on'
+    m['arm_wifi_off'] = request.form.get('arm_wifi_off') == 'on'
+    cfg['msp'] = m
+    save_config(cfg)
+    sh(['sudo', 'systemctl', 'restart', 'uav-msp.service'], timeout=30)
+    return redirect('/')
+
+
+@app.route('/apn', methods=['POST'])
+def apn():
+    new_apn = request.form.get('apn', '').strip()
+    username = request.form.get('username', '').strip()
+    password = request.form.get('password', '')
+    if new_apn and not re.fullmatch(r'[A-Za-z0-9.\-]+', new_apn):
+        return redirect('/')
+    # leerer APN ist gueltig (Default-Bearer des Modems)
+    args = ['sudo', 'nmcli', 'connection', 'modify', 'uav-wwan',
+            'gsm.apn', new_apn]
+    pin = request.form.get('pin', '').strip()
+    if request.form.get('clear_pin') == '1':
+        args += ['gsm.pin', '']
+    elif pin and re.fullmatch(r'\d{4,8}', pin):
+        args += ['gsm.pin', pin]
+    if username:
+        if re.fullmatch(r'[A-Za-z0-9.@\-]+', username):
+            args += ['gsm.username', username]
+            if password:
+                args += ['gsm.password', password]
+    else:
+        args += ['gsm.username', '', 'gsm.password', '']
+    sh(args)
+    sh(['sudo', 'nmcli', 'connection', 'up', 'uav-wwan'], timeout=90)
+    return redirect('/')
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, threaded=True)

@@ -1,0 +1,16 @@
+[Unit]
+Description=UAV-Link serial bridge (FC <-> GCS UDP)
+After=ModemManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=20
+ExecStart=/usr/bin/python3 __UAVLINK_DIR__/msp-bridge.py
+Restart=always
+RestartSec=2
+Nice=-10
+
+[Install]
+WantedBy=multi-user.target

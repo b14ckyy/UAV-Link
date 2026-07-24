@@ -1,0 +1,65 @@
+#!/bin/bash
+# UAV-Link: WireGuard-Client-Config anwenden (aus dem Web-UI aufgerufen, als root).
+#
+#   uav-wg-apply <src.conf> [dest.conf]
+#
+# Ohne dest: Produktivpfad -> schreibt /etc/wireguard/wgnet.conf, pinnt den
+#   Endpoint als /32-Route auf die LTE-Schnittstelle (Tunnel laeuft immer ueber
+#   Mobilfunk) und restartet wg-quick@wgnet.
+# Mit dest (2. Arg): Testmodus -> schreibt nur dorthin, KEINE Route, KEIN
+#   Restart (fuer sandboxed Tests, ohne den laufenden Tunnel anzufassen).
+set -u
+
+SRC="${1:-}"
+DEST="${2:-/etc/wireguard/wgnet.conf}"
+TEST=0
+[ -n "${2:-}" ] && TEST=1
+IFACE=wgnet
+WWAN=uav-wwan
+
+[ -f "$SRC" ] || { echo "ERR: Quelle $SRC fehlt"; exit 1; }
+
+# --- Validierung (bevor irgendetwas ueberschrieben wird) ---
+grep -q '\[Interface\]' "$SRC" && grep -q '\[Peer\]' "$SRC" \
+    && grep -qi 'PrivateKey' "$SRC" && grep -qi 'PublicKey' "$SRC" \
+    || { echo "ERR: keine gueltige WireGuard-Config"; exit 2; }
+
+# --- Aufbereiten: DNS-Zeilen entfernen (wg-quick braucht sonst resolvconf;
+#     wir wollen ohnehin nicht, dass der Tunnel den Pi-DNS umbiegt) ---
+TMP="$(mktemp)"
+grep -viE '^[[:space:]]*DNS[[:space:]]*=' "$SRC" > "$TMP"
+
+# --- Backup + schreiben (0600) ---
+if [ -f "$DEST" ]; then
+    cp -a "$DEST" "$DEST.bak-$(date +%Y%m%d-%H%M%S)"
+fi
+install -m 600 "$TMP" "$DEST"
+rm -f "$TMP"
+
+# --- Endpoint fuer LTE-Pinning extrahieren ---
+EP_HOST="$(grep -iE '^[[:space:]]*Endpoint' "$SRC" | head -1 \
+          | sed -E 's/.*=[[:space:]]*//; s/:[0-9]+[[:space:]]*$//')"
+EP_IP=""
+if [ -n "$EP_HOST" ]; then
+    if echo "$EP_HOST" | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+        EP_IP="$EP_HOST"
+    else
+        EP_IP="$(getent hosts "$EP_HOST" | awk '{print $1}' | head -1)"
+    fi
+fi
+echo "INFO: dest=$DEST endpoint_host=${EP_HOST:-<none>} endpoint_ip=${EP_IP:-<none>} test=$TEST"
+
+if [ "$TEST" = 1 ]; then
+    echo "INFO: Testmodus — keine Route, kein Restart"
+    exit 0
+fi
+
+# --- LTE-Route setzen (persistent im NM-Profil + sofort live) ---
+if [ -n "$EP_IP" ]; then
+    nmcli connection modify "$WWAN" ipv4.routes "$EP_IP/32" || true
+    ip route replace "$EP_IP/32" dev wwan0 2>/dev/null || true
+fi
+
+# --- Tunnel neu starten ---
+systemctl restart "wg-quick@$IFACE"
+echo "INFO: wg-quick@$IFACE neu gestartet"

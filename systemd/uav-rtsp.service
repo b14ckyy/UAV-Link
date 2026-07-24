@@ -1,0 +1,15 @@
+[Unit]
+Description=UAV-Link RTSP server (video pipeline)
+After=network.target
+
+[Service]
+User=__UAVLINK_USER__
+ExecStart=/usr/bin/python3 __UAVLINK_DIR__/rtsp-server.py
+Restart=always
+RestartSec=3
+# bcm2835-Codec nie hart killen -> sanftes SIGINT, grosszuegige Stop-Zeit
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

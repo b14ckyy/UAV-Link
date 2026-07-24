@@ -1,0 +1,25 @@
+# Secrets / local runtime state — NEVER commit
+**/webui-auth.json
+**/wgnet.conf
+!**/wgnet.conf.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+oled-venv/
+.venv/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
+
+# Claude Code local settings (per-machine)
+.claude/settings.local.json
+
+# Internal dev docs (not part of the deliverable)
+docs/
+
+# Internal/broken ground-side test tool
+tools/uav-viewer.bat

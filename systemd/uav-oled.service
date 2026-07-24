@@ -1,0 +1,12 @@
+[Unit]
+Description=UAV-Link OLED status display
+After=uav-web.service ModemManager.service
+
+[Service]
+ExecStart=__UAVLINK_DIR__/oled-venv/bin/python __UAVLINK_DIR__/oled-display.py
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

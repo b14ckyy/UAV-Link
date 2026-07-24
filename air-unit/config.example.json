@@ -1,0 +1,24 @@
+{
+  "device": "/dev/video0",
+  "width": 720,
+  "height": 480,
+  "framerate": 50,
+  "bitrate_kbps": 2500,
+  "bitrate_mode": "vbr",
+  "port": 8554,
+  "mount": "/cam",
+  "msp": {
+    "link": "usb",
+    "uart_device": "/dev/serial0",
+    "baud": 115200,
+    "udp_port": 5760,
+    "inject_link_stats": true
+  },
+  "oled": {
+    "enabled": true,
+    "controller": "ssd1306",
+    "address": "0x3C",
+    "width": 128,
+    "height": 64
+  }
+}
