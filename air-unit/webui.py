@@ -210,6 +210,14 @@ def oled_config(cfg):
     return o
 
 
+def uav_version():
+    try:
+        with open(os.path.join(BASE, 'VERSION')) as f:
+            return f.read().strip() or 'unknown'
+    except OSError:
+        return 'unknown'
+
+
 def wg_ip():
     m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)',
                   sh(['ip', '-4', '-o', 'addr', 'show', 'wgnet']))
@@ -616,6 +624,26 @@ TEMPLATE = """<!doctype html>
   </form>
 </div>
 
+<h2>Software Update</h2>
+<div class="card">
+  <div class="kv"><span>Installed</span><span>{{ version }}</span></div>
+  <form method="post" action="/update"
+        onsubmit="return confirm('Update now? The web UI is unavailable for ~1-2 min.');">
+    <div class="row">
+      <div><label>Channel</label>
+        <select name="channel">
+          <option value="releases">Releases (stable)</option>
+          <option value="beta">Beta (pre-releases)</option>
+          <option value="development">Development (main)</option>
+        </select></div>
+      <div style="display:flex;align-items:flex-end">
+        <button type="submit" style="margin:0">Update now</button></div>
+    </div>
+  </form>
+  <div class="hint">Re-runs the installer from the selected channel (over LTE or Wi-Fi).
+    Config and password are preserved. Log: <code>/var/log/uav-update.log</code>.</div>
+</div>
+
 <h2>Status Display (OLED)</h2>
 <div class="card"><form method="post" action="/oled">
   <div class="row">
@@ -810,6 +838,21 @@ LOGIN_TEMPLATE = """<!doctype html>
 </body></html>"""
 
 
+UPDATING_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="100; url=/">
+<title>UAV-Link — Updating</title>
+<style>body{font-family:system-ui,sans-serif;background:#14181c;color:#d8dde2;
+  max-width:420px;margin:6em auto;padding:0 1em;text-align:center}
+  b{color:#6fc276}</style></head><body>
+<h1>Updating…</h1>
+<p>Installing from the <b>{{ channel }}</b> channel. The web service restarts during
+the update, so this page reloads automatically in ~100&nbsp;s. You may need to log in
+again afterwards. If it doesn't return, wait a moment and reload.</p>
+</body></html>"""
+
+
 @app.before_request
 def _require_auth():
     ensure_auth()              # geloeschte Auth-Datei -> Default (Reset self-heal)
@@ -858,7 +901,8 @@ def index():
         modem=modem_info(), host=request.host.split(':')[0],
         bitrates=list(range(1000, 5001, 500)),
         msp=msp_config(cfg), msp_bauds=MSP_BAUDS, vpn_ip=wg_ip(),
-        oled=oled_config(cfg), default_pw=is_default_password(),
+        oled=oled_config(cfg), version=uav_version(),
+        default_pw=is_default_password(),
         ap_pw_warn=(wifi_status()[0] and hotspot_pw_default()),
         wifi_on=sh(['nmcli', 'radio', 'wifi']) == 'enabled',
         ap_active=wifi_status()[0], wifi_ssid=wifi_status()[1],
@@ -1012,6 +1056,16 @@ def wg_apply():
             except OSError:
                 pass
     return redirect('/')
+
+
+@app.route('/update', methods=['POST'])
+def update():
+    channel = request.form.get('channel', 'releases')
+    if channel not in ('releases', 'beta', 'development'):
+        return redirect('/')
+    sh(['sudo', 'systemctl', 'start', '--no-block',
+        f'uav-update@{channel}.service'], timeout=15)
+    return render_template_string(UPDATING_TEMPLATE, channel=channel)
 
 
 @app.route('/oled', methods=['POST'])

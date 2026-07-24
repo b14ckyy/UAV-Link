@@ -5,3 +5,4 @@ __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/qmicli -d /dev/cdc-wdm0 --nas-get
 __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/wg show *
 __UAVLINK_USER__ ALL=(root) NOPASSWD: __UAVLINK_DIR__/uav-wg-apply *
 __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-oled.service
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block uav-update@*

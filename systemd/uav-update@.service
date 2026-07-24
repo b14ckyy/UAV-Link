@@ -1,0 +1,8 @@
+[Unit]
+Description=UAV-Link self-update (%i channel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=__UAVLINK_DIR__/uav-update %i

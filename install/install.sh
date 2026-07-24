@@ -45,8 +45,11 @@ install -d -o "$UAV_USER" -g "$UAV_USER" "$UAV_DIR"
 cp -a "$REPO/air-unit/." "$UAV_DIR/"
 # never clobber the operator's runtime config / credentials
 [ -f "$UAV_DIR/config.json" ] || cp "$UAV_DIR/config.example.json" "$UAV_DIR/config.json"
+# record the installed version (repo dir name -> e.g. "2026-01-b2" or "main")
+VER="$(basename "$REPO")"; VER="${VER#UAV-Link-}"
+echo "$VER ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))" > "$UAV_DIR/VERSION"
 chown -R "$UAV_USER:$UAV_USER" "$UAV_DIR"
-chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
+chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
 
 # --- 3. OLED venv (luma.oled) --------------------------------------------------
 if [ ! -x "$UAV_DIR/oled-venv/bin/python" ]; then

@@ -1,0 +1,45 @@
+#!/bin/bash
+# UAV-Link self-update helper. Run as root by the web UI via uav-update@<channel>.service.
+#   channel: development | beta | releases
+#     development -> main branch (dev)
+#     beta        -> newest GitHub Release, including pre-releases
+#     releases    -> latest stable GitHub Release (pre-releases excluded)
+# Downloads that source package and runs its install.sh (idempotent: config +
+# credentials are preserved). Logs to /var/log/uav-update.log.
+set -uo pipefail
+REPO="b14ckyy/UAV-Link"
+CHANNEL="${1:-releases}"
+LOG=/var/log/uav-update.log
+exec >>"$LOG" 2>&1
+echo "=========================================================="
+echo "[uav-update] $(date -u '+%Y-%m-%dT%H:%M:%SZ') channel=$CHANNEL"
+
+api() { curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$1"; }
+tag_of() { grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'; }
+
+case "$CHANNEL" in
+    development)
+        URL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"; NAME="main" ;;
+    beta)
+        TAG="$(api 'releases?per_page=1' | tag_of)"
+        [ -n "$TAG" ] || { echo "[uav-update] no release published (beta channel empty)"; exit 1; }
+        URL="https://github.com/$REPO/archive/refs/tags/$TAG.tar.gz"; NAME="$TAG" ;;
+    releases|*)
+        TAG="$(api 'releases/latest' | tag_of)"
+        [ -n "$TAG" ] || { echo "[uav-update] no stable release published (releases channel empty)"; exit 1; }
+        URL="https://github.com/$REPO/archive/refs/tags/$TAG.tar.gz"; NAME="$TAG" ;;
+esac
+
+echo "[uav-update] fetching $NAME"
+D="$(mktemp -d)"
+if ! curl -fsSL "$URL" | tar -xz -C "$D"; then
+    echo "[uav-update] download/extract failed"; rm -rf "$D"; exit 1
+fi
+SH="$(echo "$D"/*/install/install.sh)"
+[ -f "$SH" ] || { echo "[uav-update] install.sh missing in package"; rm -rf "$D"; exit 1; }
+echo "[uav-update] running installer..."
+bash "$SH"
+RC=$?
+rm -rf "$D"
+echo "[uav-update] done (exit $RC)"
+exit $RC
