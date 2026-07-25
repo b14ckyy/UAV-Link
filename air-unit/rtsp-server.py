@@ -31,6 +31,10 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.j
 # Clients ohne TEARDOWN sind im Funkbetrieb der Normalfall, nicht der Fehlerfall.
 SESSION_TIMEOUT_S = 20   # ohne RTCP/Keepalive gilt eine Session als tot (Default: 60 s)
 SESSION_CLEANUP_S = 5    # Pruefintervall -> ein Zombie lebt maximal ~25 s
+
+# FPS-Watchdog (opt-in, s. on_media_configure): Fenster à 2 s. Warmup = 2 Fenster = 4 s,
+# damit der ~2 s dauernde Verbindungsaufbau sicher abgeschlossen ist, bevor gemessen wird.
+WATCHDOG_WARMUP_WINDOWS = 2
 DEFAULTS = {
     'device': 'auto',
     'width': 720,
@@ -152,8 +156,10 @@ def on_media_configure(factory, media, cfg):
             return False
         n, state['count'] = state['count'], 0
         state['windows'] += 1
-        if state['windows'] <= 1:
-            return True   # Warmup-Fenster ignorieren
+        if state['windows'] <= WATCHDOG_WARMUP_WINDOWS:
+            return True   # Warmup ignorieren: ein Connect braucht gut 2 s, ein
+                          # zu kurzes Warmup misst die noch leere Pipeline und
+                          # killt die Session genau waehrend des Verbindens
         if n < target:    # unter 50% der Sollrate (Fenster = 2s)
             log(f'FPS-WATCHDOG: ~{n/2:.0f} fps (Soll {target}) -> Session-Neustart (EOS)')
             element.send_event(Gst.Event.new_eos())
