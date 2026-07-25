@@ -21,6 +21,16 @@ gi.require_version('GstRtsp', '1.0')
 from gi.repository import Gst, GstRtsp, GstRtspServer, GLib
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+
+# Session-Reaper: gst-rtsp-server raeumt abgelaufene Sessions NICHT von selbst auf --
+# ohne periodisches session_pool.cleanup() leben sie ewig weiter. Ein Client, der ohne
+# TEARDOWN verschwindet (Funkloch, gekillter Prozess, Reconnect-Loop), hinterlaesst also
+# eine Zombie-Session, deren udpsink weiter mit voller Bitrate an einen toten Port sendet.
+# Das summiert sich: Last steigt -> FPS fallen -> der FPS-Watchdog beendet die GETEILTE
+# Media fuer ALLE Clients -> alle reconnecten -> naechste Runde. Genau diese Spirale.
+# Clients ohne TEARDOWN sind im Funkbetrieb der Normalfall, nicht der Fehlerfall.
+SESSION_TIMEOUT_S = 20   # ohne RTCP/Keepalive gilt eine Session als tot (Default: 60 s)
+SESSION_CLEANUP_S = 5    # Pruefintervall -> ein Zombie lebt maximal ~25 s
 DEFAULTS = {
     'device': 'auto',
     'width': 720,
@@ -139,6 +149,29 @@ def on_media_configure(factory, media, cfg):
     GLib.timeout_add(2000, check)
 
 
+def install_session_reaper(server):
+    """Kurzes Session-Timeout + periodisches Aufraeumen (s. Kommentar oben).
+    Muss VOR attach() passieren, damit kein Client die Signalbindung verpasst."""
+    def on_new_session(client, session):
+        session.set_timeout(SESSION_TIMEOUT_S)
+
+    server.connect('client-connected',
+                   lambda srv, client: client.connect('new-session', on_new_session))
+
+    pool = server.get_session_pool()
+
+    def reap():
+        n = pool.cleanup()
+        if n:
+            log(f'SESSION-REAPER: {n} abgelaufene Session(s) entfernt '
+                f'(Client weg ohne TEARDOWN)')
+        return True   # Timer weiterlaufen lassen
+
+    GLib.timeout_add_seconds(SESSION_CLEANUP_S, reap)
+    log(f'Session-Reaper aktiv: Timeout {SESSION_TIMEOUT_S}s, '
+        f'Cleanup alle {SESSION_CLEANUP_S}s')
+
+
 def main():
     cfg = load_config()
     dev = cfg['device']
@@ -157,6 +190,7 @@ def main():
     factory.set_protocols(GstRtsp.RTSPLowerTrans.UDP)  # kein TCP-Fallback, kein Resend
     factory.connect('media-configure', on_media_configure, cfg)
     server.get_mount_points().add_factory(cfg['mount'], factory)
+    install_session_reaper(server)
     server.attach(None)
     log(f'RTSP-Server laeuft: rtsp://0.0.0.0:{cfg["port"]}{cfg["mount"]} (UDP-only)')
 

@@ -83,6 +83,11 @@ zero latency**. `set_shared(True)` — the dongle can be opened only once, so al
 one pipeline. Resolution/bitrate/rate-control come from `config.json` and can be changed live
 (the pipeline restarts). The web UI's live preview grabs JPEG frames off the same stream.
 
+A **session reaper** (short session timeout + periodic `session_pool.cleanup()`) removes
+sessions of clients that vanished without a `TEARDOWN` — the normal case on a radio link.
+Without it those zombie sessions live forever and keep blasting UDP at dead ports, which
+drags the framerate down until the FPS watchdog restarts the *shared* media for everyone.
+
 ### Data link (MSP / MAVLink)
 
 ```
