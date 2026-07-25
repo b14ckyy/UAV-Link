@@ -114,8 +114,22 @@ def build_pipeline(cfg, dev):
 
 
 def on_media_configure(factory, media, cfg):
-    """FPS-Watchdog: Kriech-Sessions (Dongle-Lotterie) erkennen und Media
-    absichtlich beenden -> Client-Reconnect wuerfelt eine neue Session."""
+    """FPS-Watchdog -- STANDARDMAESSIG AUS (config: "fps_watchdog": true).
+
+    Er beendet die Media per EOS, wenn am Payloader zu wenige Frames ankommen.
+    Weil die Media geteilt ist (set_shared), trifft dieses EOS ALLE Clients
+    gleichzeitig -- ein kurzer Aussetzer wirft also jeden Zuschauer raus, statt
+    ihn nur ruckeln zu lassen. Gemessen: 57 Ausloesungen in 3 Stunden, was
+    genau das Bild aus 'verbindet nicht / Freeze / Reconnect' erzeugt.
+
+    Gebaut wurde er gegen angeblich einbrechende Framerates des USB-Dongles.
+    Diese Annahme ist NICHT belegt: das Verhalten liess sich auf keinem anderen
+    System reproduzieren (Pi 3, Pi 5, Debian-Laptop, Windows, OTG direkt, sowie
+    mit einem zweiten Dongle eines anderen Herstellers). Solange die Ursache
+    nicht sauber verifiziert ist, darf diese Notbremse nicht per Default in
+    einen laufenden Stream eingreifen."""
+    if not cfg.get('fps_watchdog'):
+        return
     element = media.get_element()
     pay = element.get_by_name('pay0')
     if pay is None:
