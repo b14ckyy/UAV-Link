@@ -29,8 +29,16 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.j
 # Das summiert sich: Last steigt -> FPS fallen -> der FPS-Watchdog beendet die GETEILTE
 # Media fuer ALLE Clients -> alle reconnecten -> naechste Runde. Genau diese Spirale.
 # Clients ohne TEARDOWN sind im Funkbetrieb der Normalfall, nicht der Fehlerfall.
-SESSION_TIMEOUT_S = 20   # ohne RTCP/Keepalive gilt eine Session als tot (Default: 60 s)
-SESSION_CLEANUP_S = 5    # Pruefintervall -> ein Zombie lebt maximal ~25 s
+# Timeout NICHT unter den GStreamer-Default (60 s) druecken! Eine Session lebt nur weiter,
+# solange der Client RTCP-Reports oder RTSP-Keepalives schickt. ffplay, VLC und GStreamer tun
+# das -- schlanke RTSP-Apps (z. B. auf Android) oft NICHT. Mit 20 s wurden deren Sessions nach
+# ~25 s abgeraeumt: Bild friert ein, Verbindung bricht ab. Genau so beobachtet, in H.264 und
+# mit einer unveraenderten Fremd-App, also nicht clientseitig verschuldet.
+# Der Zombie-Schutz kommt vom periodischen cleanup(), nicht vom kurzen Timeout: damit lebt
+# eine verwaiste Session ~65 s statt ewig. Wer schneller aufraeumen will, setzt in der
+# config.json "session_timeout" -- auf eigene Gefahr, s. o.
+SESSION_TIMEOUT_S = 60   # = GStreamer-Default; kuerzer killt stille, aber lebende Clients
+SESSION_CLEANUP_S = 5    # Pruefintervall -> ein Zombie lebt maximal ~65 s
 
 # FPS-Watchdog (opt-in, s. on_media_configure): Fenster à 2 s. Warmup = 2 Fenster = 4 s,
 # damit der ~2 s dauernde Verbindungsaufbau sicher abgeschlossen ist, bevor gemessen wird.
@@ -246,11 +254,13 @@ def on_media_configure(factory, media, cfg):
     GLib.timeout_add(2000, check)
 
 
-def install_session_reaper(server):
+def install_session_reaper(server, cfg):
     """Kurzes Session-Timeout + periodisches Aufraeumen (s. Kommentar oben).
     Muss VOR attach() passieren, damit kein Client die Signalbindung verpasst."""
+    timeout = int(cfg.get('session_timeout', SESSION_TIMEOUT_S) or SESSION_TIMEOUT_S)
+
     def on_new_session(client, session):
-        session.set_timeout(SESSION_TIMEOUT_S)
+        session.set_timeout(timeout)
 
     server.connect('client-connected',
                    lambda srv, client: client.connect('new-session', on_new_session))
@@ -265,7 +275,7 @@ def install_session_reaper(server):
         return True   # Timer weiterlaufen lassen
 
     GLib.timeout_add_seconds(SESSION_CLEANUP_S, reap)
-    log(f'Session-Reaper aktiv: Timeout {SESSION_TIMEOUT_S}s, '
+    log(f'Session-Reaper aktiv: Timeout {timeout}s, '
         f'Cleanup alle {SESSION_CLEANUP_S}s')
 
 
@@ -287,7 +297,7 @@ def main():
     factory.set_protocols(GstRtsp.RTSPLowerTrans.UDP)  # kein TCP-Fallback, kein Resend
     factory.connect('media-configure', on_media_configure, cfg)
     server.get_mount_points().add_factory(cfg['mount'], factory)
-    install_session_reaper(server)
+    install_session_reaper(server, cfg)
     server.attach(None)
     log(f'RTSP-Server laeuft: rtsp://0.0.0.0:{cfg["port"]}{cfg["mount"]} (UDP-only)')
 
