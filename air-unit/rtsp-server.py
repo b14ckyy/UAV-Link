@@ -148,10 +148,15 @@ def build_pipeline(cfg, dev):
     # spaet und verwerfen sie: gemessen 136-221 Drops/Minute bei 60 fps, aber nur 1-4 bei
     # 30 fps -- unabhaengig von Aufloesung und Codec. `videorate` legt die Zeitstempel auf
     # ein exaktes Gitter (gemessen: stdev 1,55 ms -> 0,00 ms) und verwirft dafuer ~1,8 %
-    # der Frames. Kostet rund ein Frame Latenz, deshalb abschaltbar: "smooth_pts": false.
-    # Geht nur, wo dekodiert wird -- im MJPEG-Passthrough gibt es kein Rohbild.
+    # der Frames.
+    #
+    # BRINGT IN DER PRAXIS NICHTS -- deshalb standardmaessig AUS ("smooth_pts": true zum
+    # Einschalten). Am Client gemessen: weiterhin ~100 Drops/30 s bei 720p60. Der Grund ist
+    # logisch: videorate korrigiert nur die ZEITSTEMPEL, die Frames KOMMEN aber weiterhin
+    # im 16/20-ms-Rhythmus an. Wer fast ohne Puffer abspielt, verwirft sie trotzdem.
+    # Geht ausserdem nur, wo dekodiert wird -- im MJPEG-Passthrough gibt es kein Rohbild.
     vrate = ('! videorate ! video/x-raw,framerate=%d/1 ' % fps
-             if cfg.get('smooth_pts', True) else '')
+             if cfg.get('smooth_pts', False) else '')
     if codec == 'mjpeg-src':
         # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
         # und 0 % CPU, dafuer hohe Bitrate (~35 Mbit bei 720p60). Fuer LAN/WLAN gedacht.
