@@ -445,8 +445,9 @@ TEMPLATE = """<!doctype html>
   <div class="row">
     <div><label>Codec</label>
       <select name="codec" id="codec" onchange="updateCodec()">
-        <option value="h264" {{ 'selected' if cfg.codec != 'mjpeg' }}>H.264 (recommended)</option>
-        <option value="mjpeg" {{ 'selected' if cfg.codec == 'mjpeg' }}>MJPEG (no H.264 decoder needed)</option>
+        <option value="h264" {{ 'selected' if cfg.codec not in ('mjpeg', 'mjpeg-src') }}>H.264 (recommended)</option>
+        <option value="mjpeg" {{ 'selected' if cfg.codec == 'mjpeg' }}>MJPEG — encoded (~10 Mbit)</option>
+        <option value="mjpeg-src" {{ 'selected' if cfg.codec == 'mjpeg-src' }}>MJPEG — source quality (LAN)</option>
       </select></div>
     <div id="bitrate-box"><label>Bitrate</label>
       <select name="bitrate_kbps">
@@ -782,29 +783,48 @@ function updateFps() {
   }
 }
 
-// Gemessene KB/Frame nach HW-JPEG-Encode (Quality fest 80), s. rtsp-server.py
-const MJPEG_KB = { "1280x720": 21.2, "720x480": 18.1, "720x576": 24.7 };
+// Messwerte 26.07.: der HW-JPEG-Encoder haelt ~10.5 Mbit und ignoriert jede
+// Qualitaetsvorgabe. Konstante Bitrate -> die Qualitaet haengt an bit/px.
+const MJPEG_HW_MBIT = 10.5;
+const MJPEG_NATIVE_KB = { "1280x720": 78.0, "720x480": 42.0, "720x576": 44.0 };
 function updateCodec() {
-  const mjpeg = document.getElementById('codec').value === 'mjpeg';
+  const codec = document.getElementById('codec').value;
+  const mjpeg = codec === 'mjpeg' || codec === 'mjpeg-src';
   document.getElementById('bitrate-box').style.display = mjpeg ? 'none' : '';
   document.getElementById('ratectl-box').style.display = mjpeg ? 'none' : '';
   const hint = document.getElementById('codec-hint');
   if (!mjpeg) {
+    hint.className = 'hint';
     hint.textContent = 'Note: CBR throttles the HW encoder to ~38 fps (measured) — testing only.';
     return;
   }
   const res = document.getElementById('resolution').value;
   const fps = parseInt(document.getElementById('framerate').value, 10) || 0;
-  let kb = MJPEG_KB[res];
-  if (kb === undefined) {
-    const p = res.split('x');
-    const px = (parseInt(p[0], 10) || 0) * (parseInt(p[1], 10) || 0);
-    kb = px ? 21.2 * px / (1280 * 720) : 0;
+  const p = res.split('x');
+  const px = (parseInt(p[0], 10) || 0) * (parseInt(p[1], 10) || 0);
+  if (codec === 'mjpeg-src') {
+    let kb = MJPEG_NATIVE_KB[res];
+    if (kb === undefined) kb = px ? 78.0 * px / (1280 * 720) : 0;
+    hint.className = 'hint';
+    hint.innerHTML = 'Source JPEG passed through untouched — best quality, no CPU cost, ' +
+      'but roughly <b>' + (kb * 1024 * 8 * fps / 1e6).toFixed(0) + ' Mbit/s</b> at ' +
+      res + ' @' + fps + ' fps. Meant for LAN/Wi-Fi. Needs a source that outputs ' +
+      'MJPEG (USB capture sticks do; CSI cameras do not).';
+    return;
   }
-  const mbit = kb * 1024 * 8 * fps / 1e6;
-  hint.innerHTML = 'Hardware JPEG encode, quality fixed — no bitrate control. ' +
-    'Estimated <b>' + mbit.toFixed(1) + ' Mbit/s</b> at ' + res + ' @' + fps +
-    ' fps (content dependent; motion runs higher). Use on a LAN or a fat link.';
+  const bpp = px && fps ? MJPEG_HW_MBIT * 1e6 / fps / px : 0;
+  let msg = 'Hardware JPEG encode, fixed at about <b>' + MJPEG_HW_MBIT.toFixed(0) +
+    ' Mbit/s</b> — the encoder ignores any quality setting, so lower resolution or ' +
+    'frame rate buys picture quality, not bandwidth. At ' + res + ' @' + fps +
+    ' fps that budget yields <b>' + bpp.toFixed(2) + ' bit/pixel</b>.';
+  if (bpp && bpp < 0.25) {
+    hint.className = 'hint bad';
+    msg += ' <b>Too little — expect blocky artefacts.</b> Halve the frame rate or ' +
+      'pick a lower resolution, or switch to "source quality" if bandwidth allows.';
+  } else {
+    hint.className = 'hint';
+  }
+  hint.innerHTML = msg;
 }
 
 function pwMatch(f, name) {
@@ -1123,7 +1143,8 @@ def save():
         cfg['mount'] = '/' + mount
     cfg['bitrate_mode'] = ('cbr' if request.form.get('bitrate_mode') == 'cbr'
                            else 'vbr')
-    cfg['codec'] = ('mjpeg' if request.form.get('codec') == 'mjpeg' else 'h264')
+    codec = request.form.get('codec')
+    cfg['codec'] = codec if codec in ('mjpeg', 'mjpeg-src') else 'h264'
     for key in ('framerate', 'bitrate_kbps', 'port'):
         try:
             val = int(request.form.get(key, DEFAULTS[key]))

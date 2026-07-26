@@ -100,29 +100,52 @@ def wait_for_device():
         time.sleep(2)
 
 
-# MJPEG: gemessene Groesse pro Frame (KB) nach HW-Encode (v4l2jpegenc, Quality fest 80).
-# JPEG ist intraframe -> pro Frame konstant, Bitrate = KB/Frame * fps. Inhaltsabhaengig,
-# bewegte Szenen liegen darueber. Gemessen 25.07. am CVBS-Signal.
-MJPEG_KB_PER_FRAME = {(1280, 720): 21.2, (720, 480): 18.1, (720, 576): 24.7}
+# MJPEG-Messungen vom 26.07. am echten CVBS-Signal.
+#
+# WICHTIG: Der bcm2835-JPEG-Encoder macht RATE-CONTROL auf ~10,5 Mbit/s und ignoriert
+# `compression_quality` vollstaendig (gemessen: Quality 20/50/80/95 -> 21,1/21,5/21,6/21,2
+# KB/Frame, also identisch). Die Bitrate ist damit praktisch konstant, egal welche
+# Aufloesung oder Framerate -- was sich aendert, ist die Qualitaet pro Frame:
+#   720p60 -> 21,8 KB/F = 0,19 bit/px  (sichtbare Blockartefakte)
+#   720p30 -> 39,2 KB/F = 0,37 bit/px  (gut)
+#   480p60 -> 21,3 KB/F = 0,51 bit/px  (gut)
+# Faustregel: unter ~0,25 bit/px wird es haesslich.
+MJPEG_HW_MBIT = 10.5
+
+# Passthrough: natives Dongle-JPEG, unkomprimiert weitergereicht (KB/Frame, gemessen).
+MJPEG_NATIVE_KB = {(1280, 720): 78.0, (720, 480): 42.0, (720, 576): 44.0}
 
 
-def mjpeg_estimate_mbit(w, h, fps):
-    """Grobe Bitratenschaetzung fuer den MJPEG-Modus (Mbit/s)."""
-    kb = MJPEG_KB_PER_FRAME.get((w, h))
-    if kb is None:                      # unbekannte Aufloesung -> auf Pixel skalieren
-        ref_px, ref_kb = 1280 * 720, 21.2
-        kb = ref_kb * (w * h) / ref_px
+def mjpeg_estimate_mbit(w, h, fps, passthrough=False):
+    """Bitratenschaetzung fuer den MJPEG-Modus (Mbit/s)."""
+    if not passthrough:
+        return MJPEG_HW_MBIT            # HW-Encoder haelt die Rate konstant
+    kb = MJPEG_NATIVE_KB.get((w, h)) or 78.0 * (w * h) / (1280 * 720)
     return kb * 1024 * 8 * fps / 1e6
+
+
+def mjpeg_bits_per_pixel(w, h, fps):
+    """Bildqualitaet des HW-Encoders: Bit pro Pixel bei fester Bitrate."""
+    return MJPEG_HW_MBIT * 1e6 / max(fps, 1) / max(w * h, 1)
 
 
 def build_pipeline(cfg, dev):
     fps = cfg['framerate']
     bitrate = cfg['bitrate_kbps'] * 1000
-    if cfg.get('codec') == 'mjpeg':
-        # HW-JPEG-Encode statt Passthrough: der Dongle komprimiert nativ sehr locker
-        # (gemessen 72 KB/Frame @720p vs 21 KB nach Re-Encode = Faktor 3,4). Ausserdem
-        # liefern CSI-Kameras gar kein JPEG zum Durchreichen -- encoden ist der einzige
-        # Weg, der fuer jede Quelle funktioniert. Quality des HW-Encoders ist fest (80).
+    codec = cfg.get('codec')
+    if codec == 'mjpeg-src':
+        # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
+        # und 0 % CPU, dafuer hohe Bitrate (~35 Mbit bei 720p60). Fuer LAN/WLAN gedacht.
+        # Setzt eine Quelle voraus, die selbst MJPEG liefert -- CSI-Kameras koennen das nicht.
+        return (
+            f'( v4l2src device={dev} '
+            f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
+            f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
+        )
+    if codec == 'mjpeg':
+        # HW-JPEG-Encode. Haelt die Bitrate bei ~10,5 Mbit (Rate-Control, s. o.) und
+        # funktioniert mit jeder Quelle, auch mit CSI-Kameras ohne eigenes JPEG.
+        # Achtung: bei 720p60 reicht das Budget nur fuer 0,19 bit/px -> Artefakte.
         return (
             f'( v4l2src device={dev} '
             f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
