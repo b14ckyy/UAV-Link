@@ -102,10 +102,19 @@ def wait_for_device():
 
 # MJPEG-Messungen vom 26.07. am echten CVBS-Signal.
 #
-# WICHTIG: Der bcm2835-JPEG-Encoder macht RATE-CONTROL auf ~10,5 Mbit/s und ignoriert
-# `compression_quality` vollstaendig (gemessen: Quality 20/50/80/95 -> 21,1/21,5/21,6/21,2
-# KB/Frame, also identisch). Die Bitrate ist damit praktisch konstant, egal welche
-# Aufloesung oder Framerate -- was sich aendert, ist die Qualitaet pro Frame:
+# WICHTIG: Der bcm2835-JPEG-Encoder regelt auf ~10 Mbit/s und ignoriert `compression_quality`
+# vollstaendig (Quality 20/50/80/95 -> 21,1/21,5/21,6/21,2 KB/Frame, also identisch).
+# Sauber nachgewiesen ohne jeden Decode-Schritt (rohe Frames direkt in den Encoder, also
+# der CSI-Fall): gleicher Inhalt, 720p60 -> 20,2 KB/F, 720p30 -> 43,8 KB/F. Halbe Framerate,
+# doppelte Framegroesse, Bitrate konstant ~10 Mbit -> Rate-Control, nicht Inhaltsabhaengigkeit.
+#
+# Es ist ein ZIELWERT, keine harte Decke: sehr einfache Bilder bleiben darunter (7,6 Mbit),
+# unkomprimierbares Rauschen ueberschiesst (39,6 Mbit), weil der Encoder am Qualitaetsanschlag
+# nicht weiter runterkommt. Der Decode konkurriert NICHT -- ohne Decode dasselbe Verhalten.
+# Der HW-Encoder ist der Begrenzer: derselbe dekodierte Inhalt liefert durch den SW-Encoder
+# 75,7 KB/F (18,6 Mbit) statt 40,1 KB/F. Fuer CSI-Kameras gilt dasselbe Limit.
+#
+# Bei festem Budget aendert sich also die Qualitaet pro Frame:
 #   720p60 -> 21,8 KB/F = 0,19 bit/px  (sichtbare Blockartefakte)
 #   720p30 -> 39,2 KB/F = 0,37 bit/px  (gut)
 #   480p60 -> 21,3 KB/F = 0,51 bit/px  (gut)
