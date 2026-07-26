@@ -142,6 +142,16 @@ def build_pipeline(cfg, dev):
     fps = cfg['framerate']
     bitrate = cfg['bitrate_kbps'] * 1000
     codec = cfg.get('codec')
+    # Zeitstempel glaetten. Der Dongle liefert auf einem 4-ms-Raster: bei 60 fps kommen
+    # Frames abwechselnd 16 und 20 ms auseinander (Soll 16,67) -> +-24 % Abweichung, bei
+    # 30 fps nur +-12 %. Player mit fast leerem Puffer erklaeren die 20-ms-Frames fuer zu
+    # spaet und verwerfen sie: gemessen 136-221 Drops/Minute bei 60 fps, aber nur 1-4 bei
+    # 30 fps -- unabhaengig von Aufloesung und Codec. `videorate` legt die Zeitstempel auf
+    # ein exaktes Gitter (gemessen: stdev 1,55 ms -> 0,00 ms) und verwirft dafuer ~1,8 %
+    # der Frames. Kostet rund ein Frame Latenz, deshalb abschaltbar: "smooth_pts": false.
+    # Geht nur, wo dekodiert wird -- im MJPEG-Passthrough gibt es kein Rohbild.
+    vrate = ('! videorate ! video/x-raw,framerate=%d/1 ' % fps
+             if cfg.get('smooth_pts', True) else '')
     if codec == 'mjpeg-src':
         # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
         # und 0 % CPU, dafuer hohe Bitrate (~35 Mbit bei 720p60). Fuer LAN/WLAN gedacht.
@@ -159,6 +169,7 @@ def build_pipeline(cfg, dev):
             f'( v4l2src device={dev} '
             f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
             f'! jpegdec max-errors=-1 '
+            f'{vrate}'
             f'! v4l2jpegenc '
             f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
         )
@@ -167,6 +178,7 @@ def build_pipeline(cfg, dev):
         f'( v4l2src device={dev} '
         f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
         f'! jpegdec max-errors=-1 '
+        f'{vrate}'
         f'! v4l2h264enc extra-controls="controls,'
         f'video_bitrate={bitrate},{cbr}'
         f'h264_i_frame_period={fps},repeat_sequence_header=1" '
