@@ -109,6 +109,25 @@ def sh(cmd, timeout=15):
         return ''
 
 
+_throttled = {'ts': 0.0, 'val': 0}
+
+
+def throttled_flags():
+    """Unterspannungs-/Throttle-Bits, gecacht.
+
+    `vcgencmd get_throttled` braucht gemessen ~9 ms und laeuft ueber die
+    VideoCore-Mailbox -- also dieselbe Einheit, die den H.264-/JPEG-Encoder
+    bedient. Die Stats-Seite pollt alle 2 s; ungecacht riss dieser Aufruf
+    zuverlaessig je einen Frame heraus (ein Drop alle 2 s im Player, exakt im
+    Takt). Der Throttle-Zustand aendert sich ohnehin selten."""
+    now = time.monotonic()
+    if now - _throttled['ts'] > 20:
+        m = re.search(r'0x([0-9a-fA-F]+)', sh(['vcgencmd', 'get_throttled']))
+        _throttled['val'] = int(m.group(1), 16) if m else 0
+        _throttled['ts'] = now
+    return _throttled['val']
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     try:
@@ -1101,8 +1120,7 @@ def api_stats():
         cpu = {'total': sum(fields), 'idle': fields[3] + fields[4]}
     except (OSError, ValueError, IndexError):
         pass
-    m = re.search(r'0x([0-9a-fA-F]+)', sh(['vcgencmd', 'get_throttled']))
-    throttled = int(m.group(1), 16) if m else 0
+    throttled = throttled_flags()
     return jsonify({'ts': time.time(), 'temp_c': temp, 'cpu': cpu,
                     'mem_total': mem_total or 1, 'mem_avail': mem_avail,
                     'net': net_counters(), 'throttled': throttled})
