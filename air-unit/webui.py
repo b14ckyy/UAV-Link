@@ -19,7 +19,8 @@ PREVIEW_PATH = '/tmp/uav-preview.jpg'
 
 DEFAULTS = {
     'device': 'auto', 'width': 720, 'height': 576, 'framerate': 50,
-    'bitrate_kbps': 2000, 'bitrate_mode': 'vbr', 'port': 8554, 'mount': '/cam',
+    'bitrate_kbps': 2000, 'bitrate_mode': 'vbr', 'codec': 'h264',
+    'port': 8554, 'mount': '/cam',
 }
 MSP_DEFAULTS = {
     'link': 'off', 'uart_device': '/dev/serial0', 'baud': 115200,
@@ -439,23 +440,28 @@ TEMPLATE = """<!doctype html>
       <select name="resolution" id="resolution"
               onchange="updateFps()"></select></div>
     <div><label>Frame rate</label>
-      <select name="framerate" id="framerate"></select></div>
+      <select name="framerate" id="framerate" onchange="updateCodec()"></select></div>
   </div>
   <div class="row">
-    <div><label>Bitrate</label>
+    <div><label>Codec</label>
+      <select name="codec" id="codec" onchange="updateCodec()">
+        <option value="h264" {{ 'selected' if cfg.codec != 'mjpeg' }}>H.264 (recommended)</option>
+        <option value="mjpeg" {{ 'selected' if cfg.codec == 'mjpeg' }}>MJPEG (no H.264 decoder needed)</option>
+      </select></div>
+    <div id="bitrate-box"><label>Bitrate</label>
       <select name="bitrate_kbps">
         {% for kbps in bitrates %}
         <option value="{{ kbps }}" {{ 'selected' if cfg.bitrate_kbps == kbps }}>
           {{ '%.1f'|format(kbps / 1000) }} Mbit/s</option>
         {% endfor %}
       </select></div>
-    <div><label>Rate control</label>
+    <div id="ratectl-box"><label>Rate control</label>
       <select name="bitrate_mode">
         <option value="vbr" {{ 'selected' if cfg.bitrate_mode == 'vbr' }}>VBR (recommended)</option>
         <option value="cbr" {{ 'selected' if cfg.bitrate_mode == 'cbr' }}>CBR</option>
       </select></div>
   </div>
-  <div class="hint">Note: CBR throttles the HW encoder to ~38 fps (measured) — testing only.</div>
+  <div class="hint" id="codec-hint"></div>
   <div class="row">
     <div><label>RTSP port</label>
       <input name="port" type="number" value="{{ cfg.port }}"></div>
@@ -776,6 +782,31 @@ function updateFps() {
   }
 }
 
+// Gemessene KB/Frame nach HW-JPEG-Encode (Quality fest 80), s. rtsp-server.py
+const MJPEG_KB = { "1280x720": 21.2, "720x480": 18.1, "720x576": 24.7 };
+function updateCodec() {
+  const mjpeg = document.getElementById('codec').value === 'mjpeg';
+  document.getElementById('bitrate-box').style.display = mjpeg ? 'none' : '';
+  document.getElementById('ratectl-box').style.display = mjpeg ? 'none' : '';
+  const hint = document.getElementById('codec-hint');
+  if (!mjpeg) {
+    hint.textContent = 'Note: CBR throttles the HW encoder to ~38 fps (measured) — testing only.';
+    return;
+  }
+  const res = document.getElementById('resolution').value;
+  const fps = parseInt(document.getElementById('framerate').value, 10) || 0;
+  let kb = MJPEG_KB[res];
+  if (kb === undefined) {
+    const p = res.split('x');
+    const px = (parseInt(p[0], 10) || 0) * (parseInt(p[1], 10) || 0);
+    kb = px ? 21.2 * px / (1280 * 720) : 0;
+  }
+  const mbit = kb * 1024 * 8 * fps / 1e6;
+  hint.innerHTML = 'Hardware JPEG encode, quality fixed — no bitrate control. ' +
+    'Estimated <b>' + mbit.toFixed(1) + ' Mbit/s</b> at ' + res + ' @' + fps +
+    ' fps (content dependent; motion runs higher). Use on a LAN or a fat link.';
+}
+
 function pwMatch(f, name) {
   if (f[name].value !== f.confirm.value) {
     alert('Passwords do not match.');
@@ -903,6 +934,7 @@ function pollBackup() {
 }
 
 loadFormats();
+updateCodec();
 pollStats();
 setInterval(pollStats, 2000);
 pollBackup();
@@ -1091,6 +1123,7 @@ def save():
         cfg['mount'] = '/' + mount
     cfg['bitrate_mode'] = ('cbr' if request.form.get('bitrate_mode') == 'cbr'
                            else 'vbr')
+    cfg['codec'] = ('mjpeg' if request.form.get('codec') == 'mjpeg' else 'h264')
     for key in ('framerate', 'bitrate_kbps', 'port'):
         try:
             val = int(request.form.get(key, DEFAULTS[key]))

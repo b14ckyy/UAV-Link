@@ -41,6 +41,7 @@ DEFAULTS = {
     'height': 576,
     'framerate': 50,
     'bitrate_kbps': 2000,
+    'codec': 'h264',
     'port': 8554,
     'mount': '/cam',
 }
@@ -99,9 +100,36 @@ def wait_for_device():
         time.sleep(2)
 
 
+# MJPEG: gemessene Groesse pro Frame (KB) nach HW-Encode (v4l2jpegenc, Quality fest 80).
+# JPEG ist intraframe -> pro Frame konstant, Bitrate = KB/Frame * fps. Inhaltsabhaengig,
+# bewegte Szenen liegen darueber. Gemessen 25.07. am CVBS-Signal.
+MJPEG_KB_PER_FRAME = {(1280, 720): 21.2, (720, 480): 18.1, (720, 576): 24.7}
+
+
+def mjpeg_estimate_mbit(w, h, fps):
+    """Grobe Bitratenschaetzung fuer den MJPEG-Modus (Mbit/s)."""
+    kb = MJPEG_KB_PER_FRAME.get((w, h))
+    if kb is None:                      # unbekannte Aufloesung -> auf Pixel skalieren
+        ref_px, ref_kb = 1280 * 720, 21.2
+        kb = ref_kb * (w * h) / ref_px
+    return kb * 1024 * 8 * fps / 1e6
+
+
 def build_pipeline(cfg, dev):
     fps = cfg['framerate']
     bitrate = cfg['bitrate_kbps'] * 1000
+    if cfg.get('codec') == 'mjpeg':
+        # HW-JPEG-Encode statt Passthrough: der Dongle komprimiert nativ sehr locker
+        # (gemessen 72 KB/Frame @720p vs 21 KB nach Re-Encode = Faktor 3,4). Ausserdem
+        # liefern CSI-Kameras gar kein JPEG zum Durchreichen -- encoden ist der einzige
+        # Weg, der fuer jede Quelle funktioniert. Quality des HW-Encoders ist fest (80).
+        return (
+            f'( v4l2src device={dev} '
+            f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
+            f'! jpegdec max-errors=-1 '
+            f'! v4l2jpegenc '
+            f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
+        )
     cbr = 'video_bitrate_mode=1,' if cfg.get('bitrate_mode') == 'cbr' else ''
     return (
         f'( v4l2src device={dev} '
