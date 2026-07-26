@@ -781,6 +781,7 @@ function updateFps() {
   if (!found && CUR.fps) {
     fsel.add(new Option(CUR.fps + ' fps (current)', CUR.fps, false, true));
   }
+  updateCodec();   // erst hier stehen Aufloesung/fps fest (Formate kommen per fetch)
 }
 
 // Messwerte 26.07.: der HW-JPEG-Encoder haelt ~10.5 Mbit und ignoriert jede
@@ -802,6 +803,11 @@ function updateCodec() {
   const fps = parseInt(document.getElementById('framerate').value, 10) || 0;
   const p = res.split('x');
   const px = (parseInt(p[0], 10) || 0) * (parseInt(p[1], 10) || 0);
+  if (!px || !fps) {          // Formate noch nicht geladen -> keine Fantasiezahl zeigen
+    hint.className = 'hint';
+    hint.textContent = 'Reading supported formats from the capture device…';
+    return;
+  }
   if (codec === 'mjpeg-src') {
     let kb = MJPEG_NATIVE_KB[res];
     if (kb === undefined) kb = px ? 78.0 * px / (1280 * 720) : 0;
@@ -813,7 +819,7 @@ function updateCodec() {
     return;
   }
   const bpp = px && fps ? MJPEG_HW_MBIT * 1e6 / fps / px : 0;
-  let msg = 'Hardware JPEG encode, fixed at about <b>' + MJPEG_HW_MBIT.toFixed(0) +
+  let msg = 'Hardware JPEG encode, fixed at about <b>' + MJPEG_HW_MBIT.toFixed(1) +
     ' Mbit/s</b> — the encoder ignores any quality setting, so lower resolution or ' +
     'frame rate buys picture quality, not bandwidth. At ' + res + ' @' + fps +
     ' fps that budget yields <b>' + bpp.toFixed(2) + ' bit/pixel</b>.';
