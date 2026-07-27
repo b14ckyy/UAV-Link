@@ -15,6 +15,58 @@ code changes**. Only two things carry model assumptions — the cellular interfa
 | Video capture | **USB CVBS→UVC dongle (MJPG)** | Any UVC dongle that outputs MJPG. Needs a USB host port (OTG / `dwc2` on the Zero). |
 | Status display *(optional)* | **128×64 I²C OLED** — SSD1306 (0.96") or SH1106 (1.3") | Controller + address selectable in the web UI. |
 
+## USB capture bandwidth on the Pi Zero 2 W — read this before buying a capture device
+
+The Zero 2 W's USB controller (`dwc_otg`) caps **isochronous** transfers — the mode every
+USB video device uses — far below the bus rate. Measured on hardware:
+
+| Requested | Delivered | Data rate |
+|-----------|-----------|-----------|
+| 1280x720 @60 | 51–55 fps (85–92 %) | 34–38 Mbit/s |
+| 1280x720 @50 | 48 fps (96 %) | 33 Mbit/s |
+| 1280x720 @30 | **60 fps → 100 %** | 19–21 Mbit/s |
+| 720x576 @60 | **60 fps → 100 %** | 21–25 Mbit/s |
+| 720x576 @50 | **50 fps → 100 %** | 19–21 Mbit/s |
+| 720x480 @60 | **60 fps → 100 %** | 22 Mbit/s |
+
+**The limit is the data rate, not the frame rate.** Everything up to roughly **22 Mbit/s**
+arrives complete, including 60 fps. Above ~33 Mbit/s frames are silently dropped, and those
+missing frames are what shows up as stutter.
+
+This is not the bus being full: bulk transfers on the same controller and hub reach
+**248 Mbit/s read / 236 Mbit/s write** (measured against a USB SSD). Isochronous transfers
+are scheduled differently — a reserved slice per microframe, with no retries.
+
+The cause is the alternate setting the driver ends up using. The capture device offers
+three isochronous modes, and `uvcvideo` consistently selects the slowest:
+
+| Alt setting | Packet size | Theoretical | Selected |
+|---|---|---|---|
+| 1 | 1x 800 B | 51 Mbit/s | **yes** |
+| 2 | 2x 1024 B | 131 Mbit/s | no |
+| 3 | 3x 1024 B | 197 Mbit/s | no |
+
+Alt 2 and 3 are *high-bandwidth* endpoints (several transactions per microframe), which
+`dwc_otg` does not appear to support — its isochronous handling is FIQ-assisted in software.
+Confirmed by reading the active alt setting during a live stream.
+
+**There is no way to force a faster mode from userspace.** Verified as ineffective:
+`uvcvideo quirks=0`, `quirks=128` (FIX_BANDWIDTH), `hwtimestamps=1`; the `dwc_otg`
+parameters are already at their most capable (`fiq_fsm_enable=Y`, `fiq_fsm_mask=15`,
+`microframe_schedule=Y`). Raising the ceiling would mean driver work.
+
+### What follows for device choice
+
+- **Capture at the source's native resolution.** A CVBS signal carries 480 or 576 lines;
+  letting the dongle upscale to 720p triples the data rate without adding any picture
+  information, and that is exactly what breaks the budget. 720x576 @50 (PAL) and
+  720x480 @60 (NTSC) both deliver **100 %** of frames.
+- **Native 720p60 MJPEG will not work on a Zero 2 W** — any such device needs 35–45 Mbit/s.
+- **Prefer capture devices with their own H.264 encoder.** They need only 5–10 Mbit/s, fit
+  comfortably, and additionally save the Pi the whole decode-and-re-encode step.
+- **A stronger Pi removes the limit.** Pi 4, Pi 5, CM4 and CM5 use xHCI controllers, which
+  handle high-bandwidth isochronous endpoints normally.
+
 ## Should work — untested
 
 ### Other Raspberry Pi models
