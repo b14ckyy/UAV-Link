@@ -253,6 +253,45 @@ def uav_version():
     return info
 
 
+GITHUB_REPO = 'b14ckyy/UAV-Link'
+_commits = {'ts': 0.0, 'data': [], 'err': ''}
+
+
+def github_commits(limit=40):
+    """Letzte Commits von main -- ueber den Atom-Feed, nicht ueber die API.
+    Der Feed hat kein Rate-Limit (die API 60/h pro IP, was hinter CGNAT schnell
+    aufgebraucht ist). Ergebnis wird kurz gecacht, damit nicht jeder Seitenaufruf
+    eine Anfrage ausloest."""
+    import urllib.request
+    now = time.monotonic()
+    if _commits['data'] and now - _commits['ts'] < 120:
+        return _commits['data'], ''
+    url = f'https://github.com/{GITHUB_REPO}/commits/main.atom'
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'uav-link'})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            xml = r.read().decode('utf-8', 'replace')
+    except Exception as e:                      # offline, DNS, Timeout ...
+        _commits['err'] = str(e)[:120]
+        return _commits['data'], _commits['err']
+    out = []
+    for entry in re.findall(r'<entry>(.*?)</entry>', xml, re.S)[:limit]:
+        m = re.search(r'Commit/([0-9a-f]{40})', entry)
+        if not m:
+            continue
+        sha = m.group(1)
+        t = re.search(r'<updated>([^<]+)</updated>', entry)
+        ttl = re.search(r'<title>(.*?)</title>', entry, re.S)
+        msg = re.sub(r'\s+', ' ', ttl.group(1)).strip() if ttl else ''
+        for a, b in (('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'), ('&quot;', '"')):
+            msg = msg.replace(a, b)
+        when = (t.group(1)[:16].replace('T', ' ') + 'Z') if t else ''
+        out.append({'sha': sha, 'short': sha[:7], 'when': when, 'msg': msg[:70]})
+    if out:
+        _commits.update(ts=now, data=out, err='')
+    return out, ''
+
+
 def wg_ip():
     m = re.search(r'inet (\d+\.\d+\.\d+\.\d+)',
                   sh(['ip', '-4', '-o', 'addr', 'show', 'wgnet']))
@@ -699,13 +738,20 @@ TEMPLATE = """<!doctype html>
         onsubmit="return confirm('Update now? The web UI is unavailable for ~1-2 min.');">
     <div class="row">
       <div><label>Channel</label>
-        <select name="channel">
+        <select name="channel" id="upd-channel" onchange="updChannel()">
           <option value="releases"{{ ' selected' if version.channel=='releases' else '' }}>Releases (stable)</option>
           <option value="beta"{{ ' selected' if version.channel=='beta' else '' }}>Beta (pre-releases)</option>
-          <option value="development"{{ ' selected' if version.channel=='development' else '' }}>Development (main)</option>
+          <option value="development"{{ ' selected' if version.channel.startswith('development') else '' }}>Development (main)</option>
         </select></div>
       <div style="display:flex;align-items:flex-end">
         <button type="submit" style="margin:0">Update now</button></div>
+    </div>
+    <div id="upd-commit-box" style="display:none">
+      <label>Commit (Development only — pick an older build to downgrade to)</label>
+      <select name="commit" id="upd-commit">
+        <option value="">latest on main (default)</option>
+      </select>
+      <div class="hint" id="upd-commit-hint">Loading commit list…</div>
     </div>
   </form>
   <div class="hint">Re-runs the installer from the selected channel (over LTE or Wi-Fi).
@@ -852,6 +898,24 @@ function updateCodec() {
   hint.innerHTML = msg;
 }
 
+let commitsLoaded = false;
+function updChannel() {
+  const dev = document.getElementById('upd-channel').value === 'development';
+  document.getElementById('upd-commit-box').style.display = dev ? '' : 'none';
+  if (!dev || commitsLoaded) return;
+  commitsLoaded = true;
+  const sel = document.getElementById('upd-commit');
+  const hint = document.getElementById('upd-commit-hint');
+  fetch('/api/commits').then(r => r.json()).then(d => {
+    if (d.error) { hint.textContent = 'Commit list unavailable: ' + d.error; return; }
+    for (const c of d.commits) {
+      sel.add(new Option(c.when + '  ' + c.short + '  ' + c.msg, c.sha));
+    }
+    hint.textContent = d.commits.length + ' commits listed, newest first. ' +
+      'Leave on "latest" for a normal update.';
+  }).catch(e => { hint.textContent = 'Commit list unavailable.'; commitsLoaded = false; });
+}
+
 function pwMatch(f, name) {
   if (f[name].value !== f.confirm.value) {
     alert('Passwords do not match.');
@@ -980,6 +1044,7 @@ function pollBackup() {
 
 loadFormats();
 updateCodec();
+updChannel();
 pollStats();
 setInterval(pollStats, 2000);
 pollBackup();
@@ -1237,9 +1302,23 @@ def update():
     channel = request.form.get('channel', 'releases')
     if channel not in ('releases', 'beta', 'development'):
         return redirect('/')
+    target, label = channel, channel
+    commit = (request.form.get('commit') or '').strip().lower()
+    if channel == 'development' and commit:
+        # Nur echte Hex-Hashes durchlassen -- der Wert landet in einem systemd-
+        # Unit-Namen und in einer URL, also strikt validieren statt vertrauen.
+        if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
+            return redirect('/')
+        target, label = commit, f'development @ {commit[:7]}'
     sh(['sudo', 'systemctl', 'start', '--no-block',
-        f'uav-update@{channel}.service'], timeout=15)
-    return render_template_string(UPDATING_TEMPLATE, channel=channel)
+        f'uav-update@{target}.service'], timeout=15)
+    return render_template_string(UPDATING_TEMPLATE, channel=label)
+
+
+@app.route('/api/commits')
+def api_commits():
+    commits, err = github_commits()
+    return jsonify({'commits': commits, 'error': err})
 
 
 @app.route('/backup', methods=['POST'])
