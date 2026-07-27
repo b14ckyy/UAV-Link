@@ -144,6 +144,18 @@ systemctl enable --now \
 for s in uav-rtsp uav-msp uav-oled uav-web; do
     systemctl try-restart "$s.service" >/dev/null 2>&1 || warn "restart $s failed"
 done
+# Ein hinterlegter WireGuard-Tunnel muss einen Reboot ueberleben. Aeltere
+# Installationen haben die Unit nie aktiviert bekommen (uav-wg-apply hat nur
+# restartet) — ein Update heilt das hier nachtraeglich. Bewusst nur enable und
+# kein start: der Tunnel ist Full-Tunnel (AllowedIPs 0.0.0.0/0), den mitten im
+# laufenden Update hochzuziehen wuerde am Routing der Verbindung drehen, ueber
+# die das Update selbst laeuft. Wirksam wird es beim naechsten Boot — und genau
+# der war ja das Problem.
+if [ -f /etc/wireguard/wgnet.conf ] \
+   && [ "$(systemctl is-enabled wg-quick@wgnet 2>/dev/null)" != enabled ]; then
+    log "activating wg-quick@wgnet for boot (config present but unit was not enabled)"
+    systemctl enable wg-quick@wgnet >/dev/null 2>&1 || warn "wg-quick enable failed"
+fi
 
 # --- 11. provisioning done: disable cloud-init for faster subsequent boots -----
 [ -d /etc/cloud ] && touch /etc/cloud/cloud-init.disabled

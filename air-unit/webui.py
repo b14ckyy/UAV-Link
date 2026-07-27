@@ -299,9 +299,28 @@ def wg_ip():
 
 
 def wg_status():
+    """Tunnelstatus in drei Zustaenden.
+
+    'up'   = Interface existiert, wg zeigt den Peer
+    'down' = Config ist hinterlegt, Tunnel laeuft aber nicht (kein Link,
+             Endpoint nicht erreichbar, Unit gescheitert)
+    'none' = ueberhaupt keine Config hinterlegt
+
+    'down' und 'none' sahen frueher identisch aus ("not configured") — das
+    schickt den Operator zum Neu-Hochladen, obwohl die Config laengst da ist.
+    Unterschieden wird ueber is-enabled: uav-wg-apply aktiviert die Unit beim
+    Anwenden, eine hinterlegte Config ist also immer auch enabled. Das geht
+    ohne sudo, /etc/wireguard selbst ist 0700 root und nicht statbar.
+    """
     out = sh(['sudo', 'wg', 'show', 'wgnet'])
-    st = {'up': bool(out), 'endpoint': '', 'handshake': '', 'transfer': '',
-          'address': wg_ip()}
+    if out:
+        state = 'up'
+    elif sh(['systemctl', 'is-enabled', 'wg-quick@wgnet']) == 'enabled':
+        state = 'down'
+    else:
+        state = 'none'
+    st = {'up': bool(out), 'state': state, 'endpoint': '', 'handshake': '',
+          'transfer': '', 'address': wg_ip()}
     for line in out.splitlines():
         line = line.strip()
         if line.startswith('endpoint:'):
@@ -645,7 +664,9 @@ TEMPLATE = """<!doctype html>
   <div class="kv">
     <span>Tunnel</span>
     <span class="{{ 'ok' if wg.handshake and 'ago' in wg.handshake else 'bad' }}">
-      {{ 'up' if wg.up else 'not configured' }}</span>
+      {% if wg.state == 'up' %}up
+      {% elif wg.state == 'down' %}configured, down
+      {% else %}not configured{% endif %}</span>
     <span>VPN IP</span><span>{{ wg.address or '–' }}</span>
     <span>Endpoint</span><span>{{ wg.endpoint or '–' }}</span>
     <span>Last handshake</span><span>{{ wg.handshake or 'never' }}</span>

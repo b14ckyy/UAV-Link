@@ -115,7 +115,8 @@ systemd watchdog and auto-restarts.
 
 The Pi dials **out** to the WireGuard server, so remote access rides inside the tunnel; the
 raw cellular IP exposes nothing (see [`SAFETY.md`](SAFETY.md)). `uav-wg-apply` writes
-`/etc/wireguard/wgnet.conf`, brings up `wg-quick@wgnet`, and pins the endpoint's route to
+`/etc/wireguard/wgnet.conf`, **enables** `wg-quick@wgnet` (so the tunnel returns after a
+reboot) plus restarts it to apply the new config, and pins the endpoint's route to
 `wwan0` so the tunnel always egresses over LTE. `wifi-fallback.py` raises the `UAV-Link` AP
 when no known network appears within 60 s (or on a 3 s hold of GPIO21/pin 40).
 

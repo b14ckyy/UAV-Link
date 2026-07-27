@@ -60,6 +60,12 @@ if [ -n "$EP_IP" ]; then
     ip route replace "$EP_IP/32" dev wwan0 2>/dev/null || true
 fi
 
-# --- Tunnel neu starten ---
+# --- Tunnel aktivieren + neu starten ---
+# enable ist der Boot-Teil (die gelieferte Unit hat WantedBy=multi-user.target),
+# restart der Sofort-Teil. Bewusst zwei Aufrufe statt `enable --now`: --now ist
+# bei einer bereits laufenden Unit ein No-Op, der Tunnel liefe dann mit der
+# ALTEN Config weiter. Ohne enable ueberlebt der Tunnel keinen Reboot.
+systemctl enable "wg-quick@$IFACE" >/dev/null 2>&1 \
+    || echo "WARN: enable wg-quick@$IFACE fehlgeschlagen — Tunnel ueberlebt keinen Reboot"
 systemctl restart "wg-quick@$IFACE"
-echo "INFO: wg-quick@$IFACE neu gestartet"
+echo "INFO: wg-quick@$IFACE aktiviert (boot-persistent) und neu gestartet"
