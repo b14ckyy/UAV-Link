@@ -42,7 +42,13 @@ apt-get install -y --no-install-recommends \
 # --- 2. code into $UAV_DIR -----------------------------------------------------
 log "deploying code to $UAV_DIR"
 install -d -o "$UAV_USER" -g "$UAV_USER" "$UAV_DIR"
-cp -a "$REPO/air-unit/." "$UAV_DIR/"
+# --remove-destination ist hier wichtig, nicht kosmetisch: uav-update laeuft
+# WAEHREND dieses Skript ausgeführt wird (es hat den Installer ja gestartet).
+# Ohne das Flag ueberschreibt cp die Datei an Ort und Stelle, also im selben
+# Inode -- und bash liest Skripte fortlaufend nach. Der laufende Updater fuehrt
+# dann Bruchstuecke des neuen Inhalts aus ("bal: command not found"). Mit dem
+# Flag wird das Ziel vorher entfernt, die laufende Datei behaelt ihren Inode.
+cp -a --remove-destination "$REPO/air-unit/." "$UAV_DIR/"
 # never clobber the operator's runtime config / credentials
 [ -f "$UAV_DIR/config.json" ] || cp "$UAV_DIR/config.example.json" "$UAV_DIR/config.json"
 # record version metadata as JSON. uav-update passes channel/commit/commit-date;
