@@ -6,6 +6,16 @@ That same property powers the **Update** button in the web UI (it just re-runs t
 
 ## Manual install (your own Pi / any Debian-based image)
 
+**Use Raspberry Pi OS Lite (64-bit).** In Raspberry Pi Imager it sits under
+*Raspberry Pi OS (other)* → **Raspberry Pi OS Lite (64-bit)** — not the Desktop or Full
+variant. The air unit is headless and is operated entirely through the web UI, so a
+desktop stack is several GB of card space and a pile of background services that never
+get used. 64-bit is required: the code is built and tested on `aarch64`.
+
+Desktop images do work if you already have one — nothing in the installer depends on
+Lite — but plan for a larger card (the 8 GB minimum in
+[`HARDWARE.md`](../HARDWARE.md) assumes Lite).
+
 ```bash
 curl -fsSL https://github.com/b14ckyy/UAV-Link/archive/refs/heads/main.tar.gz | tar -xz
 sudo bash UAV-Link-main/install/install.sh

@@ -76,8 +76,8 @@ Pending: field validation (real FC over MSP/MAVLink, video over LTE end-to-end).
 C rewrite of the bridge was evaluated and **dropped** — Python is robust enough for this
 off-the-flight-loop role.
 
-Install: run [`install/install.sh`](install/README.md) on a fresh Raspberry Pi OS, or flash
-the prebuilt golden image and update from the web UI.
+Install: run [`install/install.sh`](install/README.md) on a fresh **Raspberry Pi OS Lite
+(64-bit)**, or flash the prebuilt golden image and update from the web UI.
 
 ## Secrets
 

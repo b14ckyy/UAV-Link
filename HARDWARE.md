@@ -119,7 +119,16 @@ Any **luma.oled**-supported I²C panel. SSD1306 and SH1106 are exposed in the UI
   spike current; an undersized supply causes brownouts (CPU throttling, dropped USB video
   frames). A 2–3 A BEC works on-vehicle.
 - **microSD: 8 GB minimum, 16 GB+ recommended.** The golden image auto-expands to fill the
-  card on first boot.
+  card on first boot. The 8 GB figure assumes **Raspberry Pi OS Lite (64-bit)** — pick a
+  larger card if you install onto a Desktop image.
+
+## Operating system
+
+**Raspberry Pi OS Lite, 64-bit (`aarch64`).** In Raspberry Pi Imager: *Raspberry Pi OS
+(other)* → *Raspberry Pi OS Lite (64-bit)*. The air unit runs headless and is operated
+through the web UI, so the desktop stack only costs card space and background services.
+64-bit is not optional — the whole stack is built and tested on `aarch64`, and the
+unsupported Pi Zero 1 / Zero W fail on exactly that point (ARMv6).
 
 ## How the portability works (for tinkerers)
 

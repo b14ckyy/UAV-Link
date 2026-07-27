@@ -16,7 +16,7 @@ in `~/uav-link/` (deployed from `air-unit/`) and is driven by a handful of `syst
    │  (nmcli) · WireGuard · nftables · Flask · luma.oled · gpiozero/lgpio       │
    └──────────────────────────────────────────────────────────────────────────┘
                               │ on
-   ┌─ Raspberry Pi OS (Debian, 64-bit) + systemd ─────────────────────────────┐
+   ┌─ Raspberry Pi OS Lite (Debian, 64-bit / aarch64) + systemd ──────────────┐
    └──────────────────────────────────────────────────────────────────────────┘
 ```
 

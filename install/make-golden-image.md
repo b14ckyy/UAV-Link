@@ -5,7 +5,10 @@ once on a Pi, strip identifying/stale state, pull a disk image.
 
 ## 1. Base install (over LAN — no Wi-Fi credentials get baked in)
 
-- Flash stock Raspberry Pi OS with Raspberry Pi Imager. In the customization dialog set:
+- Flash stock **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager (under *Raspberry
+  Pi OS (other)*). Lite keeps the image small enough to publish and to fit an 8 GB card —
+  a Desktop base would bloat the release for no benefit on a headless unit. In the
+  customization dialog set:
   username **`link`**, password **`uavlink2026`**, hostname **`uav-link`**, SSH **enabled**.
   Do **not** set Wi-Fi — connect the Pi by **Ethernet (USB-LAN adapter)** instead.
 - Boot, then run the installer (only the 4G HAT needs to be attached; other hardware is
