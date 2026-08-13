@@ -151,20 +151,53 @@ def sysfs_name(dev):
         return ''
 
 
+# Rohformate, die unsere Encoder ohne Konverter annehmen (s. rtsp-server.py).
+RAW_FOURCC = ('UYVY', 'YUYV', 'NV12', 'YU12')
+
+
+def device_kind(dev):
+    """'mjpeg' (USB-Dongle), 'raw' (HDMI/CSI-Bridge) oder None."""
+    name = sysfs_name(dev)
+    if 'bcm2835' in name or 'rpivid' in name:
+        return None
+    out = sh(['v4l2-ctl', '-d', dev, '--list-formats'])
+    if 'MJPG' in out:
+        return 'mjpeg'
+    if any(f"'{f}'" in out for f in RAW_FOURCC):
+        return 'raw'
+    return None
+
+
 def video_devices():
     devs = []
     for dev in sorted(glob.glob('/dev/video*'),
                       key=lambda d: int(re.sub(r'\D', '', d) or 999)):
-        name = sysfs_name(dev)
-        if 'bcm2835' in name or 'rpivid' in name:
+        kind = device_kind(dev)
+        if not kind:
             continue
-        if 'MJPG' in sh(['v4l2-ctl', '-d', dev, '--list-formats']):
-            devs.append({'path': dev, 'name': name})
+        name = sysfs_name(dev)
+        tag = 'USB, MJPEG' if kind == 'mjpeg' else 'HDMI/CSI, raw'
+        devs.append({'path': dev, 'name': name, 'kind': kind,
+                     'label': f'{dev} — {name} ({tag})'})
     return devs
 
 
 def device_formats(dev):
-    """MJPG resolutions and framerates from v4l2 enumeration."""
+    """Aufloesungen/Raten fuer die Dropdowns.
+
+    Eine MJPEG-Quelle zaehlt eine Liste auf. Eine HDMI-Bridge hat dagegen genau
+    EINE gueltige Kombination: das, was die Quelle gerade sendet. Dort eine
+    Auswahl anzubieten waere eine Luege -- der Treiber lehnt alles andere ab.
+    """
+    if device_kind(dev) == 'raw':
+        m = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)',
+                      sh(['v4l2-ctl', '-d', dev, '--get-fmt-video']))
+        f = re.search(r'Frames per second:\s*([\d.]+)',
+                      sh(['v4l2-ctl', '-d', dev, '--get-dv-timings']))
+        if not m or m.group(1) == '0' or not f:
+            return []          # kein Signal -> nichts anzubieten
+        return [{'width': int(m.group(1)), 'height': int(m.group(2)),
+                 'fps': [round(float(f.group(1)))]}]
     out = sh(['v4l2-ctl', '-d', dev, '--list-formats-ext'])
     formats, in_mjpg, size = [], False, None
     for line in out.splitlines():
@@ -507,11 +540,12 @@ TEMPLATE = """<!doctype html>
   <select name="device" id="device" onchange="loadFormats()">
     {% for d in devices %}
     <option value="{{ d.path }}" {{ 'selected' if cfg.device == d.path }}>
-      {{ d.path }} — {{ d.name }}</option>
+      {{ d.label }}</option>
     {% endfor %}
     <option value="auto" {{ 'selected' if cfg.device == 'auto' }}>
-      auto (first MJPG capture device)</option>
+      auto (first usable capture device)</option>
   </select>
+  <div class="hint" id="src-hint"></div>
   <div class="row">
     <div><label>Resolution</label>
       <select name="resolution" id="resolution"
@@ -524,7 +558,7 @@ TEMPLATE = """<!doctype html>
       <select name="codec" id="codec" onchange="updateCodec()">
         <option value="h264" {{ 'selected' if cfg.codec not in ('mjpeg', 'mjpeg-src') }}>H.264 (recommended)</option>
         <option value="mjpeg" {{ 'selected' if cfg.codec == 'mjpeg' }}>MJPEG — encoded (~10 Mbit)</option>
-        <option value="mjpeg-src" {{ 'selected' if cfg.codec == 'mjpeg-src' }}>MJPEG — source quality (LAN)</option>
+        <option value="mjpeg-src" id="opt-mjpeg-src" {{ 'selected' if cfg.codec == 'mjpeg-src' }}>MJPEG — source quality (LAN)</option>
       </select></div>
     <div id="bitrate-box"><label>Bitrate</label>
       <select name="bitrate_kbps">
@@ -836,6 +870,7 @@ function loadFormats() {
     .then(r => r.json())
     .then(data => {
       formats = data.formats || [];
+      applySourceKind(data.kind || '', formats.length);
       const rsel = document.getElementById('resolution');
       rsel.innerHTML = '';
       let found = false;
@@ -851,6 +886,30 @@ function loadFormats() {
       updateFps();
     })
     .catch(() => {});
+}
+
+// Eine HDMI/CSI-Bridge liefert nur das, was die Quelle sendet: Aufloesung und
+// Rate sind dort keine Einstellung, sondern eine Anzeige. Und Passthrough gibt
+// es nicht, weil an der Quelle kein JPEG entsteht -- der Server wuerde stumm auf
+// H.264 zurueckfallen, was im UI wie ein ignorierter Klick aussaehe.
+function applySourceKind(kind, nFormats) {
+  const raw = kind === 'raw';
+  const hint = document.getElementById('src-hint');
+  const passthrough = document.getElementById('opt-mjpeg-src');
+  passthrough.disabled = raw;
+  passthrough.hidden = raw;
+  if (raw && document.getElementById('codec').value === 'mjpeg-src') {
+    document.getElementById('codec').value = 'h264';
+  }
+  // Aufloesung/Rate NICHT disablen: disabled-Felder werden nicht mitgeschickt,
+  // /save bekaeme leere Werte und wuerde die Config zerschiessen. Bei einer
+  // Rohquelle enthaelt die Liste ohnehin nur den einen gueltigen Eintrag.
+  if (!raw) { hint.textContent = ''; return; }
+  hint.textContent = nFormats
+    ? 'HDMI input: resolution and frame rate follow the incoming signal — '
+      + 'change them on the source device, not here.'
+    : 'HDMI bridge detected, but no signal locked. Check that the source is '
+      + 'powered and sending 720p60 or 1080p30 (the bridge cannot do 1080p60).';
 }
 
 function updateFps() {
@@ -1177,8 +1236,10 @@ def api_formats():
         devs = video_devices()
         dev = devs[0]['path'] if devs else ''
     if not re.fullmatch(r'/dev/video\d+', dev or ''):
-        return jsonify({'formats': []})
-    return jsonify({'formats': device_formats(dev)})
+        return jsonify({'formats': [], 'kind': ''})
+    # kind entscheidet im Frontend, ob Aufloesung/Rate waehlbar sind und ob
+    # MJPEG-Passthrough ueberhaupt angeboten werden darf.
+    return jsonify({'formats': device_formats(dev), 'kind': device_kind(dev) or ''})
 
 
 @app.route('/api/stats')

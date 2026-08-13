@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """UAV-Link RTSP-Server.
 
-Erstes brauchbares Capture-Device (MJPG, kein bcm2835-Codec) -> SW-JPEG-Decode
--> HW-H.264-Encode (CBR) -> RTSP (UDP-only, zero-latency payloader).
-Einstellungen: config.json daneben (spaeter per Web-UI aenderbar).
+Zwei Quellenarten, automatisch erkannt (probe_source):
+
+  USB-Dongle (MJPG)   -> SW-JPEG-Decode -> HW-Encode -> RTSP
+  HDMI/CSI-Bridge     -> Rohbilder direkt in den HW-Encoder -> RTSP
+  (z. B. TC358743)       kein Decode, kein Farbraum-Konverter
+
+Der CSI-Weg spart nicht nur die Analogwandlung davor, sondern auch beide
+Zwischenschritte in der Pipeline -- das ist der Latenzgewinn.
+
+Ausgabe: RTSP (UDP-only, zero-latency payloader).
+Einstellungen: config.json daneben (per Web-UI aenderbar).
 """
 import glob
 import json
@@ -77,34 +85,106 @@ def sysfs_name(dev):
         return ''
 
 
-def is_capture_candidate(dev):
+def run(cmd, timeout=10):
+    """Kommando ausfuehren, stdout zurueck. Leerer String bei jedem Fehler."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+# v4l2-FourCC -> GStreamer-Formatname, beschraenkt auf das, was die Hardware-
+# Encoder OHNE Farbraum-Wandlung fressen: v4l2h264enc UND v4l2jpegenc listen
+# beide UYVY/YUY2/NV12/I420 in ihren video/x-raw-Caps (am Geraet nachgesehen,
+# nicht angenommen). Fuer eine CSI-Quelle entfaellt damit jeder Konverter --
+# kein videoconvert (CPU) und nicht einmal v4l2convert (ISP). Auf einem
+# Zero 2 W ist genau das der Unterschied zwischen "laeuft nebenher" und
+# "Kern am Anschlag".
+RAW_FORMATS = {'UYVY': 'UYVY', 'YUYV': 'YUY2', 'NV12': 'NV12', 'YU12': 'I420'}
+
+
+def hdmi_setup():
+    """EDID + DV-Timings anwenden, falls eine CSI-Bridge da ist. Sonst No-Op."""
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          'uav-hdmi-setup')
+    if os.path.exists(helper):
+        for line in run([helper], timeout=25).splitlines():
+            log(line)
+
+
+def raw_geometry(dev):
+    """Aufloesung + Rate einer Rohquelle -- aus dem SIGNAL, nicht aus der Config.
+
+    Eine HDMI-Bridge liefert ausschliesslich das, worauf ihre DV-Timings gelockt
+    sind, und lehnt jede andere Geometrie ab. Die Config kann hier also nichts
+    vorgeben: wer 720p60 statt 1080p30 will, stellt die HDMI-QUELLE um.
+    Ohne gelockte Timings meldet der Treiber 0x0 -- dann ist kein Signal da.
+    """
+    m = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)',
+                  run(['v4l2-ctl', '-d', dev, '--get-fmt-video']))
+    if not m or m.group(1) == '0':
+        return None
+    f = re.search(r'Frames per second:\s*([\d.]+)',
+                  run(['v4l2-ctl', '-d', dev, '--get-dv-timings']))
+    return {'width': int(m.group(1)), 'height': int(m.group(2)),
+            'framerate': round(float(f.group(1))) if f else 0}
+
+
+def probe_source(dev):
+    """Was liefert dieses Device? -> dict, oder None wenn unbrauchbar.
+
+    kind='mjpeg' -> fertige JPEGs (USB-Dongle), Geometrie kommt aus der Config.
+    kind='raw'   -> unkomprimierte Frames (HDMI/CSI-Bridge), Geometrie aus dem Signal.
+    """
     name = sysfs_name(dev)
     if 'bcm2835' in name or 'rpivid' in name:
-        return False
-    try:
-        out = subprocess.run(['v4l2-ctl', '-d', dev, '--list-formats'],
-                             capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return 'MJPG' in out
-
-
-def find_device():
-    devs = sorted(glob.glob('/dev/video*'),
-                  key=lambda d: int(re.sub(r'\D', '', d) or 999))
-    for dev in devs:
-        if is_capture_candidate(dev):
-            return dev
+        return None
+    out = run(['v4l2-ctl', '-d', dev, '--list-formats'])
+    if 'MJPG' in out:
+        return {'kind': 'mjpeg', 'dev': dev, 'name': name}
+    for fourcc, gst_fmt in RAW_FORMATS.items():
+        if f"'{fourcc}'" in out:
+            geom = raw_geometry(dev)
+            if not geom or not geom['framerate']:
+                return None      # Bridge da, aber (noch) kein Signal
+            return dict(kind='raw', dev=dev, name=name, fmt=gst_fmt, **geom)
     return None
 
 
-def wait_for_device():
+def find_source(want=None):
+    devs = [want] if want and want != 'auto' else sorted(
+        glob.glob('/dev/video*'), key=lambda d: int(re.sub(r'\D', '', d) or 999))
+    for dev in devs:
+        src = probe_source(dev)
+        if src:
+            return src
+    return None
+
+
+def wait_for_source(want=None):
+    """Auf eine nutzbare Quelle warten.
+
+    Bei CSI reicht "Geraet existiert" nicht: ohne anliegendes HDMI-Signal steht
+    die Bridge auf 0x0. Deshalb wird periodisch erneut uav-hdmi-setup angestossen
+    -- schaltet die Quelle erst spaeter ein, faengt der Server das ohne Neustart
+    auf. Nicht bei jedem Versuch, das Skript schreibt jedes Mal das EDID neu und
+    loest damit an der Quelle einen Hotplug aus.
+    """
+    attempt = 0
     while True:
-        dev = find_device()
-        if dev:
-            log(f'Capture-Device gefunden: {dev} ({sysfs_name(dev)})')
-            return dev
-        log('Kein Capture-Device gefunden, warte...')
+        if attempt % 8 == 0:
+            hdmi_setup()
+        src = find_source(want)
+        if src:
+            geom = (f' {src["width"]}x{src["height"]}@{src["framerate"]}'
+                    if src['kind'] == 'raw' else '')
+            log(f'Quelle: {src["dev"]} ({src["name"]}) [{src["kind"]}{geom}]')
+            return src
+        if attempt == 0:
+            log('Keine nutzbare Quelle -- USB-Dongle steckt nicht, oder an der '
+                'CSI-Bridge liegt kein HDMI-Signal an. Warte...')
+        attempt += 1
         time.sleep(2)
 
 
@@ -146,10 +226,47 @@ def mjpeg_bits_per_pixel(w, h, fps):
     return MJPEG_HW_MBIT * 1e6 / max(fps, 1) / max(w * h, 1)
 
 
-def build_pipeline(cfg, dev):
-    fps = cfg['framerate']
+def adopt_geometry(cfg, src):
+    """Bei einer Rohquelle gewinnt das Signal ueber die Config.
+
+    Im Web-UI kann etwas anderes eingestellt sein, aber eine HDMI-Bridge liefert
+    ausschliesslich ihre gelockten Timings. Statt die Pipeline daran scheitern zu
+    lassen, uebernehmen wir die echten Werte -- und sagen im Log, dass wir es tun.
+    Das wirkt bewusst auch auf den FPS-Watchdog, der sonst gegen eine Wunschrate
+    messen wuerde, die nie kommen kann.
+    """
+    if src['kind'] != 'raw':
+        return
+    want = (cfg['width'], cfg['height'], cfg['framerate'])
+    have = (src['width'], src['height'], src['framerate'])
+    if want != have:
+        log(f'Signal liefert {have[0]}x{have[1]}@{have[2]}, Config wollte '
+            f'{want[0]}x{want[1]}@{want[2]} -- das Signal gewinnt. '
+            f'Aendern laesst sich das nur an der HDMI-Quelle.')
+    cfg['width'], cfg['height'], cfg['framerate'] = have
+
+
+def build_pipeline(cfg, src):
+    raw = src['kind'] == 'raw'
+    # Geometrie kommt aus der Config -- bei einer Rohquelle hat adopt_geometry()
+    # sie vorher auf das gesetzt, was das Signal tatsaechlich liefert.
+    width, height, fps = cfg['width'], cfg['height'], cfg['framerate']
     bitrate = cfg['bitrate_kbps'] * 1000
     codec = cfg.get('codec')
+    if raw and codec == 'mjpeg-src':
+        log('MJPEG-Passthrough setzt eine Quelle voraus, die selbst JPEG liefert '
+            '-- die CSI-Bridge liefert Rohbilder. Weiche auf H.264 aus.')
+        codec = 'h264'
+    # Quelle + Decode. Bei CSI faellt der Decode ersatzlos weg: es gibt nichts zu
+    # dekodieren, die Frames gehen roh in den Encoder. Das ist neben der
+    # wegfallenden Analogwandlung der zweite Gewinn gegenueber dem USB-Weg.
+    if raw:
+        caps = (f'video/x-raw,format={src["fmt"]},width={width},'
+                f'height={height},framerate={fps}/1')
+    else:
+        caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
+    source = f'v4l2src device={src["dev"]} ! {caps} '
+    decode = '' if raw else '! jpegdec max-errors=-1 '
     # Zeitstempel glaetten. Der Dongle liefert auf einem 4-ms-Raster: bei 60 fps kommen
     # Frames abwechselnd 16 und 20 ms auseinander (Soll 16,67) -> +-24 % Abweichung, bei
     # 30 fps nur +-12 %. Player mit fast leerem Puffer erklaeren die 20-ms-Frames fuer zu
@@ -168,29 +285,25 @@ def build_pipeline(cfg, dev):
     if codec == 'mjpeg-src':
         # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
         # und 0 % CPU, dafuer hohe Bitrate (~35 Mbit bei 720p60). Fuer LAN/WLAN gedacht.
-        # Setzt eine Quelle voraus, die selbst MJPEG liefert -- CSI-Kameras koennen das nicht.
+        # Nur an einer MJPEG-Quelle moeglich (oben abgefangen und umgeschaltet).
         return (
-            f'( v4l2src device={dev} '
-            f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
+            f'( {source}'
             f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
         )
     if codec == 'mjpeg':
-        # HW-JPEG-Encode. Haelt die Bitrate bei ~10,5 Mbit (Rate-Control, s. o.) und
-        # funktioniert mit jeder Quelle, auch mit CSI-Kameras ohne eigenes JPEG.
+        # HW-JPEG-Encode. Haelt die Bitrate bei ~10,5 Mbit (Rate-Control, s. o.).
         # Achtung: bei 720p60 reicht das Budget nur fuer 0,19 bit/px -> Artefakte.
         return (
-            f'( v4l2src device={dev} '
-            f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
-            f'! jpegdec max-errors=-1 '
+            f'( {source}'
+            f'{decode}'
             f'{vrate}'
             f'! v4l2jpegenc '
             f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
         )
     cbr = 'video_bitrate_mode=1,' if cfg.get('bitrate_mode') == 'cbr' else ''
     return (
-        f'( v4l2src device={dev} '
-        f'! image/jpeg,width={cfg["width"]},height={cfg["height"]},framerate={fps}/1 '
-        f'! jpegdec max-errors=-1 '
+        f'( {source}'
+        f'{decode}'
         f'{vrate}'
         f'! v4l2h264enc extra-controls="controls,'
         f'video_bitrate={bitrate},{cbr}'
@@ -281,18 +394,19 @@ def install_session_reaper(server, cfg):
 
 def main():
     cfg = load_config()
-    dev = cfg['device']
-    if dev == 'auto':
-        dev = wait_for_device()
-    else:
-        log(f'Nutze konfiguriertes Device: {dev}')
+    # Immer probeen, auch bei fest konfiguriertem Device: erst die Probe verraet,
+    # OB die Quelle JPEG oder Rohbilder liefert -- und danach richtet sich die
+    # halbe Pipeline. Ist das konfigurierte Device (noch) nicht nutzbar, warten
+    # wir darauf, statt mit einer kaputten Pipeline zu starten.
+    src = wait_for_source(cfg.get('device'))
+    adopt_geometry(cfg, src)
 
     Gst.init(None)
     server = GstRtspServer.RTSPServer()
     server.set_service(str(cfg['port']))
     factory = GstRtspServer.RTSPMediaFactory()
-    factory.set_launch(build_pipeline(cfg, dev))
-    factory.set_shared(True)   # Dongle nur einmal oeffenbar -> Clients teilen Pipeline
+    factory.set_launch(build_pipeline(cfg, src))
+    factory.set_shared(True)   # Quelle nur einmal oeffenbar -> Clients teilen Pipeline
     factory.set_latency(0)
     factory.set_protocols(GstRtsp.RTSPLowerTrans.UDP)  # kein TCP-Fallback, kein Resend
     factory.connect('media-configure', on_media_configure, cfg)

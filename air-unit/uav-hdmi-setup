@@ -1,0 +1,99 @@
+#!/bin/bash
+# UAV-Link: HDMI->CSI-Bridge (Toshiba TC358743) betriebsbereit machen.
+#
+#   uav-hdmi-setup [device]        # ohne Argument: Bridge selbst suchen
+#
+# Zwei Schritte, ohne die der Chip kein Bild liefert:
+#
+#  1. EDID. Der TC358743 hat ab Werk KEINS. Die HDMI-Quelle fragt es beim
+#     Anstecken ab, bekommt nichts und sendet daraufhin gar nicht erst -- der
+#     klassische Fall "alles richtig verkabelt, Bild trotzdem schwarz". Das EDID
+#     legt ausserdem fest, welche Modi die Quelle ueberhaupt anbietet.
+#  2. DV-Timings. Der Treiber kennt die Aufloesung des anliegenden Signals erst,
+#     wenn sie einmal abgefragt und uebernommen wurde. Vorher meldet das Device
+#     0x0 und jedes Capture scheitert sofort.
+#
+# EDID-Quelle, in dieser Reihenfolge:
+#   /boot/firmware/tc358743.edid   (Nutzer-Override, ueberlebt Updates)
+#   <skriptverzeichnis>/tc358743.edid
+#   sonst: v4l2-ctl --set-edid=type=hdmi (CTA-861, eingebaut, immer gueltig)
+#
+# Der eingebaute Typ bewirbt bis 1080p60, der TC358743 kann aber nur 165 MHz
+# Pixeltakt (= 1080p30 ODER 720p60). Quellen, die stur den hoechsten beworbenen
+# Modus waehlen, muessen deshalb ueber eine eigene EDID-Datei begrenzt werden.
+# Wer die Quelle selbst auf 720p60 stellt, braucht das nicht.
+#
+# Ohne angeschlossenes HAT ein No-Op -- das Skript laeuft beim Boot JEDER
+# Installation, auch auf Geraeten, die nie eine CSI-Bridge sehen werden.
+#
+# Exit: 0 = Timings gelockt | 2 = Bridge da, aber kein Signal | 3 = keine Bridge
+set -u
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+log() { echo "[uav-hdmi] $*"; }
+
+# --- Bridge finden ------------------------------------------------------------
+find_bridge() {
+    local dev name
+    for dev in /dev/video*; do
+        [ -e "$dev" ] || continue
+        name="$(cat "/sys/class/video4linux/$(basename "$dev")/name" 2>/dev/null)"
+        case "$name" in
+            *tc358743*|*unicam*)
+                # Nur Capture-Nodes, keine Metadaten-Nodes (unicam legt beides an)
+                v4l2-ctl -d "$dev" --all 2>/dev/null | grep -q 'Video Capture' \
+                    && { echo "$dev"; return 0; }
+                ;;
+        esac
+    done
+    return 1
+}
+
+DEV="${1:-}"
+if [ -z "$DEV" ]; then
+    DEV="$(find_bridge)" || {
+        log "keine HDMI/CSI-Bridge gefunden -- uebersprungen (kein Fehler)"
+        exit 3
+    }
+fi
+[ -e "$DEV" ] || { log "Device $DEV existiert nicht"; exit 3; }
+log "Bridge: $DEV ($(cat "/sys/class/video4linux/$(basename "$DEV")/name" 2>/dev/null))"
+
+# --- 1. EDID schreiben --------------------------------------------------------
+EDID=""
+for cand in /boot/firmware/tc358743.edid "$DIR/tc358743.edid"; do
+    [ -f "$cand" ] && { EDID="$cand"; break; }
+done
+EDID_SET=0
+if [ -n "$EDID" ]; then
+    if v4l2-ctl -d "$DEV" --set-edid="file=$EDID" --fix-edid-checksums >/dev/null 2>&1; then
+        log "EDID aus Datei: $EDID"
+        EDID_SET=1
+    else
+        log "WARN: EDID-Datei $EDID abgelehnt -- nehme das eingebaute"
+    fi
+fi
+if [ "$EDID_SET" = 0 ]; then
+    if v4l2-ctl -d "$DEV" --set-edid=type=hdmi >/dev/null 2>&1; then
+        log "EDID: eingebautes CTA-861 (type=hdmi)"
+    else
+        log "WARN: EDID konnte nicht geschrieben werden -- Quelle sendet evtl. nichts"
+    fi
+fi
+
+# Die Quelle sieht den EDID-Wechsel als Hotplug und braucht einen Moment, bis
+# sie wieder sendet. Ohne diese Pause meldet die Timing-Abfrage haeufig noch
+# "kein Signal", obwohl gleich eines anliegt.
+sleep 2
+
+# --- 2. DV-Timings vom anliegenden Signal uebernehmen -------------------------
+if ! v4l2-ctl -d "$DEV" --set-dv-bt-timings query >/dev/null 2>&1; then
+    log "kein HDMI-Signal erkannt -- Quelle aus, Kabel lose, oder Modus wird nicht unterstuetzt"
+    log "  (TC358743 kann max. 165 MHz Pixeltakt: 720p60 oder 1080p30, KEIN 1080p60)"
+    exit 2
+fi
+
+FMT="$(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null \
+       | grep -oE "Width/Height *: *[0-9]+/[0-9]+|Pixel Format *: *'[A-Z0-9]+'" | tr '\n' ' ')"
+log "Signal gelockt: $FMT"
+exit 0

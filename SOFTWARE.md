@@ -32,6 +32,7 @@ in `~/uav-link/` (deployed from `air-unit/`) and is driven by a handful of `syst
 | `uav-update` | `uav-update@<ch>` | Self-update: fetch a channel and re-run the installer. |
 | `uav-backup` | `uav-backup` | Image the SD to a USB stick. |
 | `uav-wg-apply` | *(sudo helper)* | Apply a pasted WireGuard config; pin the endpoint route to `wwan0`. |
+| `uav-hdmi-setup` | `uav-hdmi` | Make an HDMI→CSI bridge usable: write its EDID, lock DV timings. No-op without the HAT. |
 | `reset-credentials.sh` | *(helper)* | Reset the web-UI auth back to default. |
 | `uav-firewall.nft` | `nftables` | Ruleset deployed to `/etc/nftables.conf` (LTE hardening). |
 | `config.example.json` | — | Template for the runtime `config.json`. |
@@ -43,7 +44,8 @@ Installed by `install/install.sh` (apt), plus one pip venv:
 | Function | Tools / packages |
 |----------|------------------|
 | Video capture + encode + serve | **GStreamer** (`gstreamer1.0-tools`, `-plugins-base/good/bad`, `-libav`, `-rtsp`, `gir1.2-gst-rtsp-server-1.0`, `python3-gi`); HW encoder `v4l2h264enc` |
-| Video device enumeration | `v4l-utils` (`v4l2-ctl`) — the UI probes formats/resolutions |
+| Video device enumeration | `v4l-utils` (`v4l2-ctl`) — the UI probes formats/resolutions; also writes the CSI bridge's EDID and locks its DV timings |
+| I²C inspection | `i2c-tools` (`i2cdetect`) — verifying an HDMI→CSI bridge answers on the camera bus |
 | Web UI | **Flask** (`python3-flask`), stdlib only otherwise |
 | Cellular modem | **ModemManager** (`mmcli`) for connect + generic signal; **libqmi** (`qmicli`) for RSRP/RSRQ/SNR + band |
 | Networking / Wi-Fi / WWAN profile | **NetworkManager** (`nmcli`) — Wi-Fi client, hotspot, the `uav-wwan` GSM profile |

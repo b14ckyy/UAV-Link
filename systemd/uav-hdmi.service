@@ -1,0 +1,19 @@
+[Unit]
+Description=UAV-Link HDMI/CSI bridge setup (EDID + DV timings)
+# Muss vor der Pipeline laufen: ohne gelockte DV-Timings meldet das Device 0x0
+# und v4l2src scheitert beim Start.
+Before=uav-rtsp.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=__UAVLINK_USER__
+ExecStart=__UAVLINK_DIR__/uav-hdmi-setup
+# 3 = keine Bridge angeschlossen, 2 = Bridge da, aber kein Signal an HDMI.
+# Beides sind normale Betriebszustaende, keine Defekte -- die Unit darf davon
+# nicht auf "failed" gehen (sie laeuft auf JEDER Installation, auch ohne HAT).
+SuccessExitStatus=0 2 3
+
+[Install]
+WantedBy=multi-user.target

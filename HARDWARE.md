@@ -67,6 +67,48 @@ parameters are already at their most capable (`fiq_fsm_enable=Y`, `fiq_fsm_mask=
 - **A stronger Pi removes the limit.** Pi 4, Pi 5, CM4 and CM5 use xHCI controllers, which
   handle high-bandwidth isochronous endpoints normally.
 
+## HDMI capture over CSI — the way around the USB ceiling
+
+A **HDMI→CSI-2 bridge** on the camera connector sidesteps the isochronous limit entirely:
+it does not touch USB, and it removes the analog detour (digital → CVBS → digital) that
+costs both latency and picture quality. Supported chip: **Toshiba TC358743**.
+
+Two things about this chip decide whether it works at all, and UAV-Link handles both
+automatically (`air-unit/uav-hdmi-setup`, run at boot by `uav-hdmi.service` and again by
+the RTSP server whenever no usable source is found):
+
+1. **It ships without an EDID.** The HDMI source asks for one, gets nothing, and therefore
+   sends nothing — the classic "everything is wired correctly and the picture is still
+   black". The EDID also decides which modes the source will offer at all.
+2. **DV timings must be locked to the incoming signal.** Until that happens the driver
+   reports 0×0 and every capture attempt fails immediately.
+
+**The chip tops out at a 165 MHz pixel clock — 720p60 *or* 1080p30, never 1080p60.**
+The built-in EDID (`v4l2-ctl --set-edid=type=hdmi`) advertises up to 1080p60, which is
+fine for a source you set manually. A source that always picks the highest advertised mode
+needs a restricted EDID: drop a file at `/boot/firmware/tc358743.edid` and the helper uses
+it instead (it survives updates).
+
+Resolution and frame rate are **not settings** on this path — they follow the signal. The
+web UI shows them read-only, and the RTSP server adopts whatever is actually arriving.
+MJPEG "source quality" (passthrough) does not exist for CSI either: there is no JPEG at the
+source, so the server falls back to H.264 and says so in the log.
+
+Pipeline-wise this is the cheapest path available on a Zero 2 W: both `v4l2h264enc` and
+`v4l2jpegenc` accept the bridge's `UYVY` frames directly, so there is **no JPEG decode and
+no colour-space conversion** — neither `videoconvert` (CPU) nor `v4l2convert` (ISP).
+
+Bandwidth is not a concern: 720p60 in UYVY is ~885 Mbit/s and 1080p30 ~995 Mbit/s over
+CSI-2, comfortably within the Zero 2 W's two lanes.
+
+> **Status: implemented, not yet verified against hardware.** The code, the installer wiring
+> and the boot-time setup are in place; the first real capture is still pending.
+
+**Trade-off:** the installer adds `dtoverlay=tc358743` and sets `camera_auto_detect=0`
+unconditionally — harmless on a Pi without the HAT (the driver simply finds nothing to bind
+to), but it does claim the CSI connector, so an official Pi camera will not be picked up.
+UAV-Link does not support those anyway.
+
 ## Should work — untested
 
 ### Other Raspberry Pi models

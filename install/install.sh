@@ -37,6 +37,7 @@ apt-get install -y --no-install-recommends \
     gir1.2-gst-rtsp-server-1.0 python3-gi v4l-utils \
     python3-flask python3-venv python3-gpiozero python3-lgpio \
     modemmanager libqmi-utils network-manager nftables wireguard-tools socat \
+    i2c-tools \
     || warn "some packages failed to install"
 
 # --- 2. code into $UAV_DIR -----------------------------------------------------
@@ -66,7 +67,7 @@ fi
 printf '{"channel":"%s","ref":"%s","commit":"%s","commit_date":"%s","updated":"%s"}\n' \
     "$CH" "$REF" "$COMMIT" "$CDATE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$UAV_DIR/VERSION"
 chown -R "$UAV_USER:$UAV_USER" "$UAV_DIR"
-chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/uav-backup" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
+chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/uav-backup" "$UAV_DIR/uav-hdmi-setup" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
 
 # --- 3. OLED venv (luma.oled) --------------------------------------------------
 if [ ! -x "$UAV_DIR/oled-venv/bin/python" ]; then
@@ -109,10 +110,27 @@ if [ -f "$CFG" ]; then
     log "boot config: $CFG"
     [ -f "$CFG.uav-bak" ] || cp "$CFG" "$CFG.uav-bak"
     add_cfg() { grep -qxF "$1" "$CFG" || echo "$1" >> "$CFG"; }
+    # Bestehenden Schluessel ersetzen statt anhaengen: ein zweites
+    # camera_auto_detect= weiter unten wuerde das erste wieder aushebeln.
+    set_cfg() {
+        if grep -qE "^[#[:space:]]*$1=" "$CFG"; then
+            sed -i "s/^[#[:space:]]*$1=.*/$1=$2/" "$CFG"
+        else
+            echo "$1=$2" >> "$CFG"
+        fi
+    }
     add_cfg "dtoverlay=dwc2,dr_mode=host"   # USB OTG host for CVBS dongle
     add_cfg "enable_uart=1"                 # PL011 UART for MSP
     add_cfg "dtoverlay=disable-bt"          # free the UART
     add_cfg "dtparam=i2c_arm=on"            # OLED I2C
+    # HDMI->CSI-Bridge (Toshiba TC358743). Ohne HAT laeuft der Treiber ins Leere
+    # und bindet einfach nicht -- deshalb koennen wir das unbesehen setzen, auch
+    # auf Geraeten, die nie eine Bridge sehen. camera_auto_detect findet nur
+    # offizielle Pi-Kameras ueber deren EEPROM; eine HDMI-Bridge hat keins, also
+    # muss das Overlay von Hand kommen. ACHTUNG: Damit ist der CSI-Anschluss fuer
+    # eine offizielle Pi-Kamera belegt -- UAV-Link unterstuetzt die ohnehin nicht.
+    add_cfg "dtoverlay=tc358743"
+    set_cfg "camera_auto_detect" 0
 else
     warn "no config.txt found — skipping boot overlays"
 fi
@@ -133,7 +151,7 @@ udevadm control --reload-rules >/dev/null 2>&1 && udevadm trigger >/dev/null 2>&
 # --- 10. enable + start services -----------------------------------------------
 log "enabling services..."
 systemctl enable --now \
-    uav-wifi-on.service uav-wifi-fallback.service \
+    uav-wifi-on.service uav-wifi-fallback.service uav-hdmi.service \
     uav-rtsp.service uav-web.service uav-msp.service uav-oled.service \
     >/dev/null 2>&1 || warn "some services failed to start (may need the reboot)"
 # `enable --now` no-ops on an already-running unit, so an update would deploy new
