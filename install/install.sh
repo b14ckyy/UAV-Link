@@ -109,7 +109,17 @@ CMD=/boot/firmware/cmdline.txt; [ -f "$CMD" ] || CMD=/boot/cmdline.txt
 if [ -f "$CFG" ]; then
     log "boot config: $CFG"
     [ -f "$CFG.uav-bak" ] || cp "$CFG" "$CFG.uav-bak"
-    add_cfg() { grep -qxF "$1" "$CFG" || echo "$1" >> "$CFG"; }
+    # Unsere Zeilen landen per >> am Dateiende. Damit sie fuer JEDES Modell
+    # gelten, muss dort ein [all] stehen -- sonst faellt alles unter den letzten
+    # Modellfilter der Stock-Datei ([pi5] o. ae.) und wirkt auf einem Zero 2 W nie.
+    grep -qxF '[all]' "$CFG" || echo '[all]' >> "$CFG"
+    # Nur AB [all] auf Vorhandensein pruefen, nicht in der ganzen Datei: das
+    # Stock-Image hat "dtoverlay=dwc2,dr_mode=host" bereits unter [cm5] stehen.
+    # Ein grep ueber die gesamte Datei findet die Zeile und ueberspringt sie --
+    # der OTG-Host-Modus wurde auf dem Zero 2 W dadurch NIE gesetzt (13.08. bemerkt).
+    add_cfg() {
+        sed -n '/^\[all\]/,$p' "$CFG" | grep -qxF "$1" || echo "$1" >> "$CFG"
+    }
     # Bestehenden Schluessel ersetzen statt anhaengen: ein zweites
     # camera_auto_detect= weiter unten wuerde das erste wieder aushebeln.
     set_cfg() {
@@ -138,6 +148,11 @@ if [ -f "$CMD" ]; then
     [ -f "$CMD.uav-bak" ] || cp "$CMD" "$CMD.uav-bak"
     sed -i 's/console=serial0,[0-9]* //' "$CMD"   # free the serial console
 fi
+# i2c-dev legt die /dev/i2c-* Knoten an. Ohne das Modul findet i2cdetect gar
+# keinen Bus -- man scannt dann ins Leere und haelt das faelschlich fuer
+# "Chip antwortet nicht". Rein fuer die Diagnose, der Betrieb braucht es nicht.
+grep -qxF i2c-dev /etc/modules 2>/dev/null || echo i2c-dev >> /etc/modules
+modprobe i2c-dev 2>/dev/null || true
 
 # --- 9. WWAN profile (empty APN -> configured later via web UI) ----------------
 if ! nmcli -t -f NAME connection show 2>/dev/null | grep -qx uav-wwan; then

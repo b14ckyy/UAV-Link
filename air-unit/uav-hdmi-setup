@@ -59,6 +59,36 @@ fi
 [ -e "$DEV" ] || { log "Device $DEV existiert nicht"; exit 3; }
 log "Bridge: $DEV ($(cat "/sys/class/video4linux/$(basename "$DEV")/name" 2>/dev/null))"
 
+signal_locked() {
+    v4l2-ctl -d "$DEV" --get-dv-timings 2>/dev/null | grep -qE 'Active width: *[1-9]'
+}
+
+force_uyvy() {
+    # Die Bridge bietet BGR3, UYVY und RGB3 an und nimmt BGR3 als Default.
+    # BGR3 sind 24 bit statt 16 -- 50 % mehr CSI-Bandbreite fuer exakt dieselbe
+    # Bildinformation, und der Encoder muesste zusaetzlich Farbraum wandeln.
+    # UYVY nehmen v4l2h264enc und v4l2jpegenc direkt entgegen.
+    v4l2-ctl -d "$DEV" --set-fmt-video=pixelformat=UYVY >/dev/null 2>&1
+}
+
+report() {
+    log "Signal: $(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null \
+        | grep -oE "Width/Height *: *[0-9]+/[0-9]+|Pixel Format *: *'[A-Z0-9]+'" \
+        | tr '\n' ' ')$(v4l2-ctl -d "$DEV" --get-dv-timings 2>/dev/null \
+        | grep -oE '\([0-9.]+ frames per second\)')"
+}
+
+# --- Laeuft schon? Dann das EDID NICHT anfassen -------------------------------
+# Jeder EDID-Schreibvorgang wirkt auf die Quelle wie ein Hotplug: ein Laptop
+# schaltet den Ausgang komplett ab und handelt neu aus. Der RTSP-Server ruft
+# dieses Skript periodisch auf, solange er keine Quelle hat -- ohne diese
+# Abkuerzung wuerde ein laufendes Signal im Minutentakt abgewuergt.
+if signal_locked; then
+    force_uyvy
+    report
+    exit 0
+fi
+
 # --- 1. EDID schreiben --------------------------------------------------------
 EDID=""
 for cand in /boot/firmware/tc358743.edid "$DIR/tc358743.edid"; do
@@ -81,19 +111,22 @@ if [ "$EDID_SET" = 0 ]; then
     fi
 fi
 
-# Die Quelle sieht den EDID-Wechsel als Hotplug und braucht einen Moment, bis
-# sie wieder sendet. Ohne diese Pause meldet die Timing-Abfrage haeufig noch
-# "kein Signal", obwohl gleich eines anliegt.
-sleep 2
+# --- 2. Auf das Signal warten und die Timings uebernehmen ---------------------
+# Die Quelle sieht den EDID-Wechsel als Hotplug, schaltet den Ausgang ab und
+# handelt neu aus. Ein fester "sleep 2" reicht dafuer nicht -- ein Laptop
+# braucht deutlich laenger, und beim Booten ist der Pi ohnehin frueher fertig
+# als die Gegenseite. Deshalb pollen statt raten.
+for _ in $(seq 1 15); do
+    sleep 1
+    v4l2-ctl -d "$DEV" --set-dv-bt-timings query >/dev/null 2>&1 && break
+done
 
-# --- 2. DV-Timings vom anliegenden Signal uebernehmen -------------------------
-if ! v4l2-ctl -d "$DEV" --set-dv-bt-timings query >/dev/null 2>&1; then
+if ! signal_locked; then
     log "kein HDMI-Signal erkannt -- Quelle aus, Kabel lose, oder Modus wird nicht unterstuetzt"
     log "  (TC358743 kann max. 165 MHz Pixeltakt: 720p60 oder 1080p30, KEIN 1080p60)"
     exit 2
 fi
 
-FMT="$(v4l2-ctl -d "$DEV" --get-fmt-video 2>/dev/null \
-       | grep -oE "Width/Height *: *[0-9]+/[0-9]+|Pixel Format *: *'[A-Z0-9]+'" | tr '\n' ' ')"
-log "Signal gelockt: $FMT"
+force_uyvy
+report
 exit 0

@@ -155,6 +155,25 @@ def sysfs_name(dev):
 RAW_FOURCC = ('UYVY', 'YUYV', 'NV12', 'YU12')
 
 
+def dv_framerate(dev):
+    """Bildrate einer HDMI-Quelle aus den DV-Timings -- gerechnet, nicht gelesen.
+
+    Pixeltakt/Gesamtgeometrie sind eindeutig; die lesbare Rate steht nur als
+    Klammerzusatz im Fliesstext. Muss identisch zu rtsp-server.py bleiben,
+    sonst zeigt das UI eine andere Rate an als die Pipeline benutzt.
+    """
+    out = sh(['v4l2-ctl', '-d', dev, '--get-dv-timings'])
+    clk = re.search(r'Pixelclock:\s*(\d+)', out)
+    tw = re.search(r'Total width:\s*(\d+)', out)
+    th = re.search(r'Total height:\s*(\d+)', out)
+    if clk and tw and th:
+        total = int(tw.group(1)) * int(th.group(1))
+        if total:
+            return round(int(clk.group(1)) / total)
+    m = re.search(r'([\d.]+)\s*frames per second', out, re.I)
+    return round(float(m.group(1))) if m else 0
+
+
 def device_kind(dev):
     """'mjpeg' (USB-Dongle), 'raw' (HDMI/CSI-Bridge) oder None."""
     name = sysfs_name(dev)
@@ -192,12 +211,11 @@ def device_formats(dev):
     if device_kind(dev) == 'raw':
         m = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)',
                       sh(['v4l2-ctl', '-d', dev, '--get-fmt-video']))
-        f = re.search(r'Frames per second:\s*([\d.]+)',
-                      sh(['v4l2-ctl', '-d', dev, '--get-dv-timings']))
-        if not m or m.group(1) == '0' or not f:
+        fps = dv_framerate(dev)
+        if not m or m.group(1) == '0' or not fps:
             return []          # kein Signal -> nichts anzubieten
         return [{'width': int(m.group(1)), 'height': int(m.group(2)),
-                 'fps': [round(float(f.group(1)))]}]
+                 'fps': [fps]}]
     out = sh(['v4l2-ctl', '-d', dev, '--list-formats-ext'])
     formats, in_mjpg, size = [], False, None
     for line in out.splitlines():

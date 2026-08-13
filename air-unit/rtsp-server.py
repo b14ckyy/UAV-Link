@@ -103,6 +103,32 @@ def run(cmd, timeout=10):
 # "Kern am Anschlag".
 RAW_FORMATS = {'UYVY': 'UYVY', 'YUYV': 'YUY2', 'NV12': 'NV12', 'YU12': 'I420'}
 
+# v4l2-Colorspace -> GStreamer-Colorimetry.
+#
+# Ohne diese Angabe in den Caps fixiert GStreamer die Colorimetry selbst und
+# waehlt fuer HD-Aufloesungen bt709. Der TC358743 meldet aber SMPTE 170M
+# (= bt601), und v4l2src bricht dann schon vor dem ersten Frame ab:
+#   "Device '/dev/video0' does not support 2:3:5:4 colorimetry"
+#   "Device wants bt601 colorimetry"
+# Am Geraet reproduziert -- mit colorimetry=bt601 laufen 60 Frames 1080p30 in
+# 2258 ms durch, ohne bleibt die Pipeline sofort stehen. Gilt nur fuer
+# Rohquellen: bei MJPEG steckt der Farbraum im JPEG selbst.
+V4L2_COLORIMETRY = {'SMPTE 170M': 'bt601', 'Rec. 709': 'bt709',
+                    'sRGB': 'sRGB', 'BT.2020': 'bt2020'}
+
+
+def raw_colorimetry(dev):
+    """Colorimetry der Rohquelle, oder None wenn unbekannt.
+
+    Bewusst nicht auf bt601 hart verdrahtet: ein anderes Capture-Board darf
+    etwas anderes melden. Kennen wir den Wert nicht, lassen wir die Angabe weg
+    und ueberlassen GStreamer die Wahl wie bisher -- schlechter als vorher wird
+    es dadurch nicht.
+    """
+    m = re.search(r'^\s*Colorspace\s*:\s*(.+?)\s*$',
+                  run(['v4l2-ctl', '-d', dev, '--get-fmt-video']), re.M)
+    return V4L2_COLORIMETRY.get(m.group(1)) if m else None
+
 
 def hdmi_setup():
     """EDID + DV-Timings anwenden, falls eine CSI-Bridge da ist. Sonst No-Op."""
@@ -125,10 +151,30 @@ def raw_geometry(dev):
                   run(['v4l2-ctl', '-d', dev, '--get-fmt-video']))
     if not m or m.group(1) == '0':
         return None
-    f = re.search(r'Frames per second:\s*([\d.]+)',
-                  run(['v4l2-ctl', '-d', dev, '--get-dv-timings']))
     return {'width': int(m.group(1)), 'height': int(m.group(2)),
-            'framerate': round(float(f.group(1))) if f else 0}
+            'framerate': dv_framerate(dev)}
+
+
+def dv_framerate(dev):
+    """Bildrate aus den DV-Timings, primaer GERECHNET statt gelesen.
+
+    Pixeltakt und Gesamtgeometrie sind eindeutige Zahlen; die lesbare Rate steht
+    nur als Klammerzusatz im Fliesstext ("74250000 Hz (30.00 frames per second)").
+    Genau daran bin ich schon einmal gescheitert -- ein Regex auf
+    "Frames per second:" fand nie etwas, framerate blieb 0, und der Server hat
+    daraufhin JEDE CSI-Quelle als unbrauchbar verworfen. Der Klammerwert bleibt
+    als Rueckfall, falls eine v4l-utils-Version die Totale nicht ausgibt.
+    """
+    out = run(['v4l2-ctl', '-d', dev, '--get-dv-timings'])
+    clk = re.search(r'Pixelclock:\s*(\d+)', out)
+    tw = re.search(r'Total width:\s*(\d+)', out)
+    th = re.search(r'Total height:\s*(\d+)', out)
+    if clk and tw and th:
+        total = int(tw.group(1)) * int(th.group(1))
+        if total:
+            return round(int(clk.group(1)) / total)
+    m = re.search(r'([\d.]+)\s*frames per second', out, re.I)
+    return round(float(m.group(1))) if m else 0
 
 
 def probe_source(dev):
@@ -148,7 +194,8 @@ def probe_source(dev):
             geom = raw_geometry(dev)
             if not geom or not geom['framerate']:
                 return None      # Bridge da, aber (noch) kein Signal
-            return dict(kind='raw', dev=dev, name=name, fmt=gst_fmt, **geom)
+            return dict(kind='raw', dev=dev, name=name, fmt=gst_fmt,
+                        colorimetry=raw_colorimetry(dev), **geom)
     return None
 
 
@@ -261,8 +308,10 @@ def build_pipeline(cfg, src):
     # dekodieren, die Frames gehen roh in den Encoder. Das ist neben der
     # wegfallenden Analogwandlung der zweite Gewinn gegenueber dem USB-Weg.
     if raw:
+        colorimetry = (f',colorimetry={src["colorimetry"]}'
+                       if src.get('colorimetry') else '')
         caps = (f'video/x-raw,format={src["fmt"]},width={width},'
-                f'height={height},framerate={fps}/1')
+                f'height={height},framerate={fps}/1{colorimetry}')
     else:
         caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
     source = f'v4l2src device={src["dev"]} ! {caps} '
