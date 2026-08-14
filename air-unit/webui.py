@@ -1321,7 +1321,7 @@ def index():
     return render_template_string(
         TEMPLATE, cfg=cfg, devices=video_devices(),
         modem=modem_info(), host=request.host.split(':')[0],
-        bitrates=list(range(1000, 5001, 500)),
+        bitrates=list(range(1000, 7001, 500)),
         msp=msp_config(cfg), msp_bauds=MSP_BAUDS, vpn_ip=wg_ip(),
         oled=oled_config(cfg), version=uav_version(),
         usb=usb_backup_target(),
