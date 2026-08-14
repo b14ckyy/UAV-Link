@@ -20,6 +20,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import gi
@@ -177,6 +178,73 @@ def dv_framerate(dev):
     return round(float(m.group(1))) if m else 0
 
 
+def query_geometry(dev):
+    """Geometrie des ERKANNTEN Signals (query), nicht der eingestellten Timings.
+
+    --get-dv-timings zeigt, worauf das Device eingestellt IST -- das bleibt
+    auch dann stehen, wenn die Quelle laengst etwas anderes sendet oder weg
+    ist. Nur --query-dv-timings fragt den Chip, was JETZT anliegt; ohne Signal
+    scheitert der Aufruf (-> None). Bildrate wie in dv_framerate aus
+    Pixeltakt/Gesamtgeometrie gerechnet.
+    """
+    out = run(['v4l2-ctl', '-d', dev, '--query-dv-timings'])
+    w = re.search(r'Active width:\s*(\d+)', out)
+    h = re.search(r'Active height:\s*(\d+)', out)
+    if not w or not h or w.group(1) == '0':
+        return None
+    clk = re.search(r'Pixelclock:\s*(\d+)', out)
+    tw = re.search(r'Total width:\s*(\d+)', out)
+    th = re.search(r'Total height:\s*(\d+)', out)
+    fps = 0
+    if clk and tw and th:
+        total = int(tw.group(1)) * int(th.group(1))
+        if total:
+            fps = round(int(clk.group(1)) / total)
+    return {'width': int(w.group(1)), 'height': int(h.group(1)),
+            'framerate': fps}
+
+
+SIGNAL_POLL_S = 3
+
+
+def watch_signal(src):
+    """HDMI-Signal ueberwachen und bei Wechsel/Verlust sauber neu starten.
+
+    Bei einer Rohquelle bestimmt das Signal die Pipeline-Geometrie. Stellt die
+    Quelle um (720p60 -> 1080p30) oder faellt sie weg, laeuft die Pipeline ins
+    Leere -- ohne dass es jemand merkt, ausser am eingefrorenen Bild. Deshalb:
+    alle SIGNAL_POLL_S das erkannte Signal mit dem uebernommenen vergleichen.
+
+    Restart-Mechanik: SIGINT an den eigenen Prozess. Das ist exakt der Weg, den
+    auch systemd beim Stop nimmt (KillSignal=SIGINT) -- sauberer Teardown ohne
+    SIGKILL am bcm2835-Codec -- und Restart=always startet den Dienst neu, der
+    dann in wait_for_source auf das neue Signal lockt.
+
+    Debounce: erst neu starten, wenn ZWEI aufeinanderfolgende Messungen
+    denselben abweichenden Wert zeigen. Ein EDID-Hotplug der Gegenseite laesst
+    das Signal kurz flackern; darauf sofort zu reagieren wuerde einen
+    Restart-Sturm ausloesen.
+    """
+    expect = (src['width'], src['height'], src['framerate'])
+    last = None
+    while True:
+        time.sleep(SIGNAL_POLL_S)
+        g = query_geometry(src['dev'])
+        now = (g['width'], g['height'], g['framerate']) if g else None
+        # Rate 0 = Pixeltakt (noch) nicht lesbar -> nur Geometrie vergleichen
+        if now is not None and (now == expect
+                                or (now[2] == 0 and now[:2] == expect[:2])):
+            last = None
+            continue
+        if last is not None and now == last:
+            log(f'HDMI-Signal geaendert: {expect[0]}x{expect[1]}@{expect[2]} '
+                f'-> {"%dx%d@%d" % now if now else "kein Signal"} '
+                f'-- Pipeline wird neu gestartet')
+            os.kill(os.getpid(), signal.SIGINT)
+            return
+        last = now
+
+
 def probe_source(dev):
     """Was liefert dieses Device? -> dict, oder None wenn unbrauchbar.
 
@@ -274,11 +342,13 @@ def mjpeg_bits_per_pixel(w, h, fps):
 
 
 def adopt_geometry(cfg, src):
-    """Bei einer Rohquelle gewinnt das Signal ueber die Config.
+    """Bei einer Rohquelle setzt das Signal die OBERGRENZE, die Config darf drunter.
 
-    Im Web-UI kann etwas anderes eingestellt sein, aber eine HDMI-Bridge liefert
-    ausschliesslich ihre gelockten Timings. Statt die Pipeline daran scheitern zu
-    lassen, uebernehmen wir die echten Werte -- und sagen im Log, dass wir es tun.
+    Eine HDMI-Bridge liefert ausschliesslich ihre gelockten Timings -- mehr als
+    das Signal geht nie. Eine KLEINERE Zielgeometrie ist dagegen erlaubt: der
+    ISP skaliert in Hardware herunter und videorate laesst Frames aus, um
+    Bandbreite zu sparen (s. build_pipeline). Wuensche OBERHALB des Signals
+    (oder Nullwerte) werden wie bisher auf das Signal gesetzt -- mit Log.
     Das wirkt bewusst auch auf den FPS-Watchdog, der sonst gegen eine Wunschrate
     messen wuerde, die nie kommen kann.
     """
@@ -286,10 +356,16 @@ def adopt_geometry(cfg, src):
         return
     want = (cfg['width'], cfg['height'], cfg['framerate'])
     have = (src['width'], src['height'], src['framerate'])
-    if want != have:
-        log(f'Signal liefert {have[0]}x{have[1]}@{have[2]}, Config wollte '
-            f'{want[0]}x{want[1]}@{want[2]} -- das Signal gewinnt. '
-            f'Aendern laesst sich das nur an der HDMI-Quelle.')
+    if want == have:
+        return
+    if (0 < cfg['width'] <= src['width'] and 0 < cfg['height'] <= src['height']
+            and 0 < cfg['framerate'] <= src['framerate']):
+        log(f'Signal {have[0]}x{have[1]}@{have[2]}, Ziel {want[0]}x{want[1]}'
+            f'@{want[2]} -- ISP skaliert herunter (Bandbreite sparen).')
+        return
+    log(f'Signal liefert {have[0]}x{have[1]}@{have[2]}, Config wollte '
+        f'{want[0]}x{want[1]}@{want[2]} -- das Signal gewinnt. Mehr als das '
+        f'Signal geht nur an der HDMI-Quelle selbst; weniger per Auswahl im UI.')
     cfg['width'], cfg['height'], cfg['framerate'] = have
 
 
@@ -308,14 +384,29 @@ def build_pipeline(cfg, src):
     # dekodieren, die Frames gehen roh in den Encoder. Das ist neben der
     # wegfallenden Analogwandlung der zweite Gewinn gegenueber dem USB-Weg.
     if raw:
+        # Die Quell-Caps beschreiben immer das SIGNAL -- die Bridge liefert
+        # nichts anderes. Ist eine kleinere Zielgeometrie konfiguriert
+        # (adopt_geometry hat sie durchgelassen), wird dahinter reduziert:
+        # videorate drop-only duennt die Bildrate aus (BEVOR skaliert wird,
+        # verworfene Frames kosten den ISP dann nichts), der ISP (v4l2convert,
+        # /dev/video12) skaliert in Hardware -- keine CPU-Last. PAR 1:1
+        # festnageln, damit die minimale Rundung der Zielbreite (16er-Raster)
+        # nicht als krummer Pixel-Aspect im Stream landet.
         colorimetry = (f',colorimetry={src["colorimetry"]}'
                        if src.get('colorimetry') else '')
-        caps = (f'video/x-raw,format={src["fmt"]},width={width},'
-                f'height={height},framerate={fps}/1{colorimetry}')
+        caps = (f'video/x-raw,format={src["fmt"]},width={src["width"]},'
+                f'height={src["height"]},framerate={src["framerate"]}/1'
+                f'{colorimetry}')
     else:
         caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
     source = f'v4l2src device={src["dev"]} ! {caps} '
     decode = '' if raw else '! jpegdec max-errors=-1 '
+    scale = ''
+    if raw and fps < src['framerate']:
+        scale += f'! videorate drop-only=true ! video/x-raw,framerate={fps}/1 '
+    if raw and (width, height) != (src['width'], src['height']):
+        scale += (f'! v4l2convert ! video/x-raw,width={width},height={height},'
+                  f'pixel-aspect-ratio=1/1 ')
     # Zeitstempel glaetten. Der Dongle liefert auf einem 4-ms-Raster: bei 60 fps kommen
     # Frames abwechselnd 16 und 20 ms auseinander (Soll 16,67) -> +-24 % Abweichung, bei
     # 30 fps nur +-12 %. Player mit fast leerem Puffer erklaeren die 20-ms-Frames fuer zu
@@ -345,6 +436,7 @@ def build_pipeline(cfg, src):
         return (
             f'( {source}'
             f'{decode}'
+            f'{scale}'
             f'{vrate}'
             f'! v4l2jpegenc '
             f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
@@ -353,6 +445,7 @@ def build_pipeline(cfg, src):
     return (
         f'( {source}'
         f'{decode}'
+        f'{scale}'
         f'{vrate}'
         f'! v4l2h264enc extra-controls="controls,'
         f'video_bitrate={bitrate},{cbr}'
@@ -449,6 +542,8 @@ def main():
     # wir darauf, statt mit einer kaputten Pipeline zu starten.
     src = wait_for_source(cfg.get('device'))
     adopt_geometry(cfg, src)
+    if src['kind'] == 'raw':
+        threading.Thread(target=watch_signal, args=(src,), daemon=True).start()
 
     Gst.init(None)
     server = GstRtspServer.RTSPServer()

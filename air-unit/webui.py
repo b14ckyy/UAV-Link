@@ -204,9 +204,11 @@ def video_devices():
 def device_formats(dev):
     """Aufloesungen/Raten fuer die Dropdowns.
 
-    Eine MJPEG-Quelle zaehlt eine Liste auf. Eine HDMI-Bridge hat dagegen genau
-    EINE gueltige Kombination: das, was die Quelle gerade sendet. Dort eine
-    Auswahl anzubieten waere eine Luege -- der Treiber lehnt alles andere ab.
+    Eine MJPEG-Quelle zaehlt eine Liste auf. Eine HDMI-Bridge liefert dagegen
+    genau das, was die Quelle sendet -- MEHR geht dort nie. KLEINER geht aber:
+    der ISP skaliert in Hardware herunter und videorate laesst Frames aus
+    (s. build_pipeline im rtsp-server). Angeboten wird deshalb das Signal
+    selbst plus kleinere Standards im selben Seitenverhaeltnis.
     """
     if device_kind(dev) == 'raw':
         m = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)',
@@ -214,8 +216,21 @@ def device_formats(dev):
         fps = dv_framerate(dev)
         if not m or m.group(1) == '0' or not fps:
             return []          # kein Signal -> nichts anzubieten
-        return [{'width': int(m.group(1)), 'height': int(m.group(2)),
-                 'fps': [fps]}]
+        w, h = int(m.group(1)), int(m.group(2))
+        # Raten: Signalrate plus ganzzahlige Teiler (videorate drop-only kann
+        # sauber nur ausduennen), nichts unter 15 fps.
+        rates = [fps]
+        while rates[-1] // 2 >= 15:
+            rates.append(rates[-1] // 2)
+        # Breite aus dem Seitenverhaeltnis des Signals, auf 16 gerundet
+        # (Encoder-Alignment): 1080p -> 1280x720 und 848x480; 720p -> 848x480.
+        formats = [{'width': w, 'height': h, 'fps': rates}]
+        for th in (720, 480):
+            if th >= h:
+                continue
+            tw = round(w * th / h / 16) * 16
+            formats.append({'width': tw, 'height': th, 'fps': rates})
+        return formats
     out = sh(['v4l2-ctl', '-d', dev, '--list-formats-ext'])
     formats, in_mjpg, size = [], False, None
     for line in out.splitlines():
@@ -898,8 +913,18 @@ function loadFormats() {
         rsel.add(opt);
         if (val === CUR.res) found = true;
       }
-      if (!found && CUR.res !== 'x') {
-        rsel.add(new Option(CUR.res + ' (current)', CUR.res, false, true));
+      if (!found && formats.length) {
+        // Die konfigurierte Aufloesung gibt es an diesem Device nicht: auf die
+        // naechstgelegene (nach Pixelzahl) springen. Eine "(current)"-Option
+        // anzubieten waere eine Luege -- der Treiber wuerde sie ablehnen.
+        const p = CUR.res.split('x');
+        const cpx = (parseInt(p[0], 10) || 0) * (parseInt(p[1], 10) || 0);
+        let best = 0, bestd = Infinity;
+        formats.forEach((f, i) => {
+          const d = Math.abs(f.width * f.height - cpx);
+          if (d < bestd) { bestd = d; best = i; }
+        });
+        rsel.selectedIndex = best;
       }
       updateFps();
     })
@@ -924,8 +949,9 @@ function applySourceKind(kind, nFormats) {
   // Rohquelle enthaelt die Liste ohnehin nur den einen gueltigen Eintrag.
   if (!raw) { hint.textContent = ''; return; }
   hint.textContent = nFormats
-    ? 'HDMI input: resolution and frame rate follow the incoming signal — '
-      + 'change them on the source device, not here.'
+    ? 'HDMI input: the top entry is the incoming signal. Smaller entries are '
+      + 'downscaled in hardware (ISP) to save bandwidth — no CPU cost. For '
+      + 'more than the signal, change the source device.'
     : 'HDMI bridge detected, but no signal locked. Check that the source is '
       + 'powered and sending 720p60 or 1080p30 (the bridge cannot do 1080p60).';
 }
@@ -941,8 +967,15 @@ function updateFps() {
     fsel.add(new Option(r + ' fps', r, false, String(r) === CUR.fps));
     if (String(r) === CUR.fps) found = true;
   }
-  if (!found && CUR.fps) {
-    fsel.add(new Option(CUR.fps + ' fps (current)', CUR.fps, false, true));
+  if (!found && rates.length) {
+    // Konfigurierte Rate nicht im Angebot -> naechstgelegene waehlen
+    const cur = parseInt(CUR.fps, 10) || 0;
+    let best = 0, bestd = Infinity;
+    rates.forEach((r, i) => {
+      const d = Math.abs(r - cur);
+      if (d < bestd) { bestd = d; best = i; }
+    });
+    fsel.selectedIndex = best;
   }
   updateCodec();   // erst hier stehen Aufloesung/fps fest (Formate kommen per fetch)
 }
@@ -1302,12 +1335,21 @@ def preview():
             except OSError:
                 pass
             url = f"rtsp://127.0.0.1:{cfg['port']}{cfg['mount']}"
+            # Mid-GOP-Falle: laeuft die geteilte Pipeline schon (ein anderer
+            # Client schaut), steigt der Snapshot mitten in die GOP ein --
+            # avdec rekonstruiert dann ohne Referenzbild und liefert graue
+            # Frames, und snapshot=true nimmt genau den ersten davon. Deshalb
+            # wartet der Depayloader aufs naechste Keyframe (kommt jede
+            # Sekunde, h264_i_frame_period=fps) und korrupte Frames werden
+            # verworfen. Startet die Preview die Pipeline selbst, ist Frame 1
+            # ohnehin ein IDR -- dann aendern beide Optionen nichts.
             subprocess.run(
                 ['gst-launch-1.0', '-q', 'rtspsrc', f'location={url}',
-                 'latency=0', 'protocols=udp', '!', 'rtph264depay', '!',
-                 'h264parse', '!', 'avdec_h264', '!', 'videoconvert', '!',
-                 'jpegenc', 'snapshot=true', '!', 'filesink',
-                 f'location={PREVIEW_PATH}'],
+                 'latency=0', 'protocols=udp', '!',
+                 'rtph264depay', 'wait-for-keyframe=true', '!',
+                 'h264parse', '!', 'avdec_h264', 'output-corrupt=false', '!',
+                 'videoconvert', '!', 'jpegenc', 'snapshot=true', '!',
+                 'filesink', f'location={PREVIEW_PATH}'],
                 capture_output=True, timeout=10, check=False)
             preview_ts = time.time()
     if os.path.exists(PREVIEW_PATH) and os.path.getsize(PREVIEW_PATH) > 0:
