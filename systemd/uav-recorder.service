@@ -1,0 +1,19 @@
+[Unit]
+Description=UAV-Link stream recorder (H.264 -> USB storage, MPEG-TS)
+# Nach dem RTSP-Server starten (nur Reihenfolge-Hint; der Recorder wartet
+# selbst in einer Schleife, bis der Stream erreichbar ist).
+After=uav-rtsp.service
+
+[Service]
+# root: muss den USB-Datentraeger mounten. Beendet sich mit Exit 0, wenn
+# "record.enabled" in der config.json aus ist -- das Web-UI togglet per
+# systemctl restart (Config schreiben, restart, fertig).
+ExecStart=__UAVLINK_DIR__/uav-recorder
+Restart=on-failure
+RestartSec=5
+# SIGTERM -> Skript-Trap beendet gst sauber (SIGINT/EOS), synct, unmountet.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

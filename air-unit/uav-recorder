@@ -1,0 +1,161 @@
+#!/bin/bash
+# UAV-Link: H.264-Stream parallel zur Ausstrahlung auf USB-Speicher aufzeichnen.
+#
+# Laeuft als root via uav-recorder.service (root: muss den USB-Datentraeger
+# mounten). Verbindet sich als ganz normaler lokaler RTSP-Client auf den
+# eigenen Server -- dadurch ist die Aufnahme komplett vom Serverinnenleben
+# entkoppelt UND haelt die geteilte Pipeline am Leben, auch wenn keine
+# Bodenstation zuschaut. Der fertige H.264 wird nur abgezweigt und in
+# MPEG-TS-Dateien geschrieben: keine Umkodierung, ~9 % CPU (gemessen).
+#
+# Warum MPEG-TS und nicht MP4/MOV: MP4/MOV schreiben ihren Index erst beim
+# sauberen Schliessen -- Stromverlust (LiPo leer, Crash) macht die Datei
+# unlesbar, und zwar genau bei den Fluegen, die man am dringendsten sehen
+# will. TS ist gegen hartes Abschneiden immun; am 14.08. verifiziert
+# (SIGKILL mitten im Schreiben -> Datei bis zur letzten Sekunde abspielbar,
+# ffmpeg-Volldecode ohne einen einzigen Fehler). Wer ein "sauberes" MP4
+# will, remuxt am PC verlustfrei: ffmpeg -i rec.ts -c copy rec.mp4
+#
+# Konfiguration in config.json (per Web-UI):
+#   "record": { "enabled": true|false, "device": "auto" | "sda1" }
+# "auto" = erste USB-Partition mit Dateisystem. Die SD-Karte ist als Ziel
+# grundsaetzlich ausgeschlossen (System-Laufwerk).
+#
+# Der Dienst beendet sich mit Exit 0, wenn Aufnahme deaktiviert ist -- das
+# Web-UI togglet per "systemctl restart": Config schreiben, restart, fertig.
+set -uo pipefail
+
+STATUS=/run/uav-recorder.status
+LOG=/var/log/uav-recorder.log
+MNT=/mnt/uav-rec
+DIR="$(cd "$(dirname "$0")" && pwd)"
+CFG="$DIR/config.json"
+MIN_FREE_MB=200            # darunter: Aufnahme stoppen, statt die Karte vollzuschreiben
+GST_PID=""
+MOUNTED=0
+STOPPING=0
+
+exec >>"$LOG" 2>&1
+echo "==================================================================="
+echo "[uav-recorder] $(date -u '+%Y-%m-%dT%H:%M:%SZ') start"
+
+status() { printf '%s\n' "$1" > "$STATUS"; chmod 644 "$STATUS"; }
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+cleanup() {
+    STOPPING=1
+    # gst-launch beendet auf SIGINT sauber (EOS); TS braucht ohnehin kein
+    # Finalisieren. NIE SIGKILL -- haengt zwar nicht am bcm2835-Codec (wir
+    # dekodieren nichts), aber sauber ist sauber.
+    [ -n "$GST_PID" ] && kill -INT "$GST_PID" 2>/dev/null
+    [ -n "$GST_PID" ] && wait "$GST_PID" 2>/dev/null
+    sync
+    [ "$MOUNTED" = 1 ] && umount "$MNT" 2>/dev/null
+    status '{"state":"stopped"}'
+    echo "[uav-recorder] gestoppt"
+    exit 0
+}
+trap cleanup TERM INT
+
+fail() {
+    echo "[uav-recorder] ERROR: $1"
+    status "{\"state\":\"error\",\"error\":\"$(json_str "$1")\"}"
+    [ "$MOUNTED" = 1 ] && umount "$MNT" 2>/dev/null
+    # Exit 0: ein Konfigurations-/Hardwareproblem soll keinen systemd-
+    # Restart-Sturm ausloesen; der Fehlertext steht im Status fuers Web-UI.
+    exit 0
+}
+
+# --- Konfiguration lesen -------------------------------------------------------
+eval "$(python3 - "$CFG" <<'EOF'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    cfg = {}
+rec = cfg.get('record') or {}
+print(f"REC_ENABLED={'1' if rec.get('enabled') else '0'}")
+print(f"REC_DEVICE={rec.get('device', 'auto')}")
+print(f"RTSP_PORT={cfg.get('port', 8554)}")
+print(f"RTSP_MOUNT={cfg.get('mount', '/cam')}")
+print(f"CODEC={cfg.get('codec', 'h264')}")
+EOF
+)"
+
+if [ "$REC_ENABLED" != 1 ]; then
+    status '{"state":"disabled"}'
+    echo "[uav-recorder] Aufnahme deaktiviert -- Ende"
+    exit 0
+fi
+case "$CODEC" in
+    mjpeg|mjpeg-src) fail "recording needs the H.264 codec (MJPEG is not supported)" ;;
+esac
+
+# --- Ziel-Partition bestimmen (SD ist tabu) ------------------------------------
+ROOTSRC="$(findmnt -no SOURCE / 2>/dev/null)"
+SD="$(lsblk -no pkname "$ROOTSRC" 2>/dev/null | head -1)"
+
+if [ "$REC_DEVICE" = auto ]; then
+    PART="$(lsblk -rno NAME,TYPE,FSTYPE,PKNAME | awk -v sd="$SD" \
+        '$2=="part" && $3!="" && $4!=sd {print $1; exit}')"
+    [ -n "$PART" ] || fail "no USB storage detected -- plug one in"
+else
+    PART="$REC_DEVICE"
+fi
+DEVPART="/dev/$PART"
+[ -b "$DEVPART" ] || fail "partition $PART not found"
+PARENT="$(lsblk -no pkname "$DEVPART" | head -1)"
+[ "$PARENT" != "$SD" ] || fail "refusing: $PART is on the system SD card"
+TRAN="$(lsblk -dno TRAN "/dev/$PARENT" 2>/dev/null)"
+[ "$TRAN" = usb ] || fail "$PART is not on a USB device"
+
+# --- mounten (vorhandenen Mount weiterverwenden) -------------------------------
+MP="$(findmnt -fno TARGET "$DEVPART" 2>/dev/null)"
+if [ -z "$MP" ]; then
+    mkdir -p "$MNT"
+    mount "$DEVPART" "$MNT" || fail "mounting $DEVPART failed"
+    MOUNTED=1; MP="$MNT"
+fi
+echo "[uav-recorder] Ziel: $DEVPART auf $MP"
+
+# --- Aufnahmeschleife ----------------------------------------------------------
+# Eine Datei pro Verbindung: reisst der Server die Verbindung ab (Restart bei
+# Signalwechsel, Quelle weg), beginnt der naechste Versuch ein NEUES Segment.
+# wait-for-keyframe: die Datei beginnt exakt auf einem IDR -- ohne das fehlen
+# die ersten Frames bis zum naechsten Keyframe (Mid-GOP-Einstieg in die
+# geteilte Pipeline; dieselbe Falle wie bei der Web-UI-Preview).
+URL="rtsp://127.0.0.1:${RTSP_PORT}${RTSP_MOUNT}"
+while [ "$STOPPING" = 0 ]; do
+    FREE_MB=$(( $(df -B1 --output=avail "$MP" | tail -1 | tr -d ' ') / 1024 / 1024 ))
+    if [ "$FREE_MB" -lt "$MIN_FREE_MB" ]; then
+        fail "storage full (${FREE_MB} MB free, need ${MIN_FREE_MB} MB) -- recording stopped"
+    fi
+    # Ohne NTP-Sync (keine RTC!) stimmt die Uhr nicht absolut, aber die Namen
+    # bleiben eindeutig: bei Kollision wird hochgezaehlt.
+    BASE="rec-$(date -u '+%Y%m%d-%H%M%S')"
+    F="$MP/$BASE.ts"; N=1
+    while [ -e "$F" ]; do F="$MP/$BASE-$N.ts"; N=$((N + 1)); done
+    status "{\"state\":\"recording\",\"file\":\"$(json_str "$(basename "$F")")\",\"free_mb\":$FREE_MB}"
+    echo "[uav-recorder] Segment: $F (${FREE_MB} MB frei)"
+    gst-launch-1.0 -q rtspsrc location="$URL" protocols=udp latency=100 \
+        ! rtph264depay wait-for-keyframe=true ! h264parse \
+        ! mpegtsmux ! filesink location="$F" &
+    GST_PID=$!
+    wait "$GST_PID" 2>/dev/null
+    GST_PID=""
+    sync
+    [ "$STOPPING" = 1 ] && break
+    if [ ! -s "$F" ]; then
+        # Nichts angekommen: Server aus, keine Quelle, oder Codec passt nicht.
+        rm -f "$F"
+        status '{"state":"waiting","error":"stream not available -- retrying"}'
+        echo "[uav-recorder] Stream nicht erreichbar -- neuer Versuch in 3 s"
+        sleep 3 &
+        wait $! 2>/dev/null
+    else
+        echo "[uav-recorder] Segment beendet: $F ($(stat -c %s "$F") Bytes)"
+        sleep 1 &
+        wait $! 2>/dev/null
+    fi
+done
+cleanup

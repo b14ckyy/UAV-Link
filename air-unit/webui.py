@@ -445,6 +445,33 @@ def net_counters():
     return counters
 
 
+def usb_record_targets():
+    """Alle USB-Partitionen mit Dateisystem -- Ziele fuer den Recorder.
+
+    Die SD-Karte taucht hier nie auf (System-Laufwerk); lsblk filtert auf
+    TRAN=usb. Detection only, kein root noetig."""
+    rows = []
+    for line in sh(['lsblk', '-Pno',
+                    'NAME,TYPE,TRAN,FSTYPE,SIZE,PKNAME']).splitlines():
+        d = dict(re.findall(r'(\w+)="([^"]*)"', line))
+        if d:
+            rows.append(d)
+    usb_disks = {r['NAME'] for r in rows
+                 if r.get('TYPE') == 'disk' and r.get('TRAN') == 'usb'}
+    return [{'dev': r['NAME'], 'fstype': r['FSTYPE'], 'size': r['SIZE']}
+            for r in rows if r.get('TYPE') == 'part'
+            and r.get('PKNAME') in usb_disks and r.get('FSTYPE')]
+
+
+def recorder_status():
+    """Zustand des Recorder-Diensts aus /run/uav-recorder.status (JSON)."""
+    try:
+        with open('/run/uav-recorder.status') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def usb_backup_target():
     """First USB block device (never the SD) + its first filesystem partition.
     Detection only -- lsblk needs no root."""
@@ -609,6 +636,37 @@ TEMPLATE = """<!doctype html>
       <input name="port" type="number" value="{{ cfg.port }}"></div>
     <div><label>Mount path</label>
       <input name="mount" value="{{ cfg.mount }}"></div>
+  </div>
+  <div class="row">
+    <div><label>&nbsp;</label>
+      <label style="display:flex;align-items:center;gap:.5em;margin:0">
+        <input type="checkbox" name="record_enabled" value="1"
+               style="width:auto" {{ 'checked' if rec.enabled }}>
+        Record to USB storage</label></div>
+    <div><label>Storage</label>
+      <select name="record_device">
+        <option value="auto" {{ 'selected' if rec.get('device', 'auto') == 'auto' }}>
+          auto (first USB partition)</option>
+        {% for t in rec_targets %}
+        <option value="{{ t.dev }}" {{ 'selected' if rec.get('device') == t.dev }}>
+          {{ t.dev }} — {{ t.size }} ({{ t.fstype }})</option>
+        {% endfor %}
+      </select></div>
+  </div>
+  <div class="hint">
+    {% if rec_status and rec_status.state == 'recording' %}
+      Recording to <b>{{ rec_status.file }}</b> ({{ rec_status.free_mb }} MB free).
+    {% elif rec_status and rec_status.state == 'error' %}
+      Recorder error: {{ rec_status.error }}
+    {% elif rec_status and rec_status.state == 'waiting' %}
+      Recorder waiting for the stream…
+    {% elif rec.enabled %}
+      Recorder starting…
+    {% endif %}
+    {% if not rec_targets %}No USB storage detected — plug in a stick to record.{% endif %}
+    Records the H.264 stream untouched as MPEG-TS (crash-safe; survives power
+    loss). One file per stream session. Convert losslessly on the PC:
+    ffmpeg -i rec.ts -c copy rec.mp4
   </div>
   <button type="submit">Save &amp; restart pipeline</button>
 </form></div>
@@ -1267,6 +1325,8 @@ def index():
         msp=msp_config(cfg), msp_bauds=MSP_BAUDS, vpn_ip=wg_ip(),
         oled=oled_config(cfg), version=uav_version(),
         usb=usb_backup_target(),
+        rec=(cfg.get('record') or {}), rec_targets=usb_record_targets(),
+        rec_status=recorder_status(),
         default_pw=is_default_password(),
         ap_pw_warn=(wifi_status()[0] and hotspot_pw_default()),
         wifi_on=sh(['nmcli', 'radio', 'wifi']) == 'enabled',
@@ -1378,8 +1438,18 @@ def save():
         except ValueError:
             val = DEFAULTS[key]
         cfg[key] = val if 0 < val <= 65535 else DEFAULTS[key]
+    rec = cfg.get('record') or {}
+    rec['enabled'] = bool(request.form.get('record_enabled'))
+    rdev = request.form.get('record_device', 'auto')
+    rec['device'] = (rdev if rdev == 'auto'
+                     or re.fullmatch(r'[a-z]+[0-9]+', rdev) else 'auto')
+    cfg['record'] = rec
     save_config(cfg)
     sh(['sudo', 'systemctl', 'restart', 'uav-rtsp.service'], timeout=30)
+    # Recorder immer mit-restarten: uebernimmt die neue Config und beginnt
+    # nach dem Pipeline-Neustart ein frisches Segment. Deaktiviert -> das
+    # Skript beendet sich sofort mit Exit 0 (Dienst inaktiv).
+    sh(['sudo', 'systemctl', 'restart', 'uav-recorder.service'], timeout=20)
     return redirect('/')
 
 

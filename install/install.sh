@@ -168,13 +168,14 @@ log "enabling services..."
 systemctl enable --now \
     uav-wifi-on.service uav-wifi-fallback.service uav-hdmi.service \
     uav-rtsp.service uav-web.service uav-msp.service uav-oled.service \
+    uav-recorder.service \
     >/dev/null 2>&1 || warn "some services failed to start (may need the reboot)"
 # `enable --now` no-ops on an already-running unit, so an update would deploy new
 # code but keep the old process. Restart the long-running services so updates take
 # effect immediately. Detached-safe: updates run under uav-update@.service, so
 # restarting uav-web does not kill the running updater. try-restart skips units
 # that aren't running (e.g. uav-oled without OLED hardware).
-for s in uav-rtsp uav-msp uav-oled uav-web; do
+for s in uav-rtsp uav-msp uav-oled uav-web uav-recorder; do
     systemctl try-restart "$s.service" >/dev/null 2>&1 || warn "restart $s failed"
 done
 # Ein hinterlegter WireGuard-Tunnel muss einen Reboot ueberleben. Aeltere
