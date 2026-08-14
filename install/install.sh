@@ -67,7 +67,7 @@ fi
 printf '{"channel":"%s","ref":"%s","commit":"%s","commit_date":"%s","updated":"%s"}\n' \
     "$CH" "$REF" "$COMMIT" "$CDATE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$UAV_DIR/VERSION"
 chown -R "$UAV_USER:$UAV_USER" "$UAV_DIR"
-chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/uav-backup" "$UAV_DIR/uav-hdmi-setup" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
+chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/uav-backup" "$UAV_DIR/uav-hdmi-setup" "$UAV_DIR/uav-recorder" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
 
 # --- 3. OLED venv (luma.oled) --------------------------------------------------
 if [ ! -x "$UAV_DIR/oled-venv/bin/python" ]; then
