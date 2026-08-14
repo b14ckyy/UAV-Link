@@ -21,5 +21,8 @@ Thumbs.db
 # Internal dev docs (not part of the deliverable)
 docs/
 
+# Claude working rules (personal, not part of the deliverable for now)
+CLAUDE.md
+
 # Internal/broken ground-side test tool
 tools/uav-viewer.bat
