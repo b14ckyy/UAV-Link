@@ -59,8 +59,21 @@ fi
 [ -e "$DEV" ] || { log "Device $DEV existiert nicht"; exit 3; }
 log "Bridge: $DEV ($(cat "/sys/class/video4linux/$(basename "$DEV")/name" 2>/dev/null))"
 
-signal_locked() {
-    v4l2-ctl -d "$DEV" --get-dv-timings 2>/dev/null | grep -qE 'Active width: *[1-9]'
+# ACHTUNG, zwei verschiedene Fragen an den Treiber:
+#   --query-dv-timings  = "was liegt JETZT am HDMI-Eingang an?"  (scheitert ohne Signal)
+#   --get-dv-timings    = "worauf ist das Device EINGESTELLT?"   (zeigt ohne Signal
+#                          die 640x480-Defaults -- sieht aus wie ein Lock, ist keiner)
+# Die Unterscheidung ist der Kern dieses Skripts: Die alte Version fragte hier
+# get statt query, hielt die Defaults fuer ein gelocktes Signal und uebersprang
+# das EDID-Schreiben -- die Quelle sah nie ein Display und sendete nie.
+signal_detected() {
+    v4l2-ctl -d "$DEV" --query-dv-timings 2>/dev/null | grep -qE 'Active width: *[1-9]'
+}
+
+active_dims() {
+    # "1920x1080" aus query bzw. get -- fuer den Abgleich erkannt vs. eingestellt
+    v4l2-ctl -d "$DEV" "$1" 2>/dev/null \
+        | grep -oE 'Active (width|height): *[0-9]+' | grep -oE '[0-9]+' | paste -sd x -
 }
 
 force_uyvy() {
@@ -78,12 +91,20 @@ report() {
         | grep -oE '\([0-9.]+ frames per second\)')"
 }
 
-# --- Laeuft schon? Dann das EDID NICHT anfassen -------------------------------
+# --- Signal liegt schon an? Dann das EDID NICHT anfassen ----------------------
 # Jeder EDID-Schreibvorgang wirkt auf die Quelle wie ein Hotplug: ein Laptop
 # schaltet den Ausgang komplett ab und handelt neu aus. Der RTSP-Server ruft
 # dieses Skript periodisch auf, solange er keine Quelle hat -- ohne diese
 # Abkuerzung wuerde ein laufendes Signal im Minutentakt abgewuergt.
-if signal_locked; then
+# Massgeblich ist das ERKANNTE Signal (query), nicht die eingestellten Timings.
+# Passen die eingestellten Timings nicht zum Signal (z. B. 640x480-Default nach
+# dem Boot, Quelle liefert 1080p), werden sie uebernommen -- das ist kein
+# Hotplug, die Quelle merkt davon nichts.
+if signal_detected; then
+    if [ "$(active_dims --query-dv-timings)" != "$(active_dims --get-dv-timings)" ]; then
+        v4l2-ctl -d "$DEV" --set-dv-bt-timings query >/dev/null 2>&1 \
+            && log "Timings vom Signal uebernommen"
+    fi
     force_uyvy
     report
     exit 0
@@ -121,7 +142,7 @@ for _ in $(seq 1 15); do
     v4l2-ctl -d "$DEV" --set-dv-bt-timings query >/dev/null 2>&1 && break
 done
 
-if ! signal_locked; then
+if ! signal_detected; then
     log "kein HDMI-Signal erkannt -- Quelle aus, Kabel lose, oder Modus wird nicht unterstuetzt"
     log "  (TC358743 kann max. 165 MHz Pixeltakt: 720p60 oder 1080p30, KEIN 1080p60)"
     exit 2
