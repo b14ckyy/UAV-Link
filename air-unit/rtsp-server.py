@@ -358,15 +358,24 @@ def adopt_geometry(cfg, src):
     have = (src['width'], src['height'], src['framerate'])
     if want == have:
         return
-    if (0 < cfg['width'] <= src['width'] and 0 < cfg['height'] <= src['height']
+    # Nur die BILDRATE darf unter dem Signal liegen (videorate drop-only).
+    # Aufloesungs-Downscale ueber den ISP ist gebaut, aber GEPARKT: der
+    # bcm2835-ISP verklemmt sich im RTSP-Harness in einem Race und der erste
+    # Frame wird nie fertig (Pipeline haengt stumm, Clients reconnecten
+    # endlos) -- Befund und Beweiskette in STATUS.md, 14.08. Deshalb wird die
+    # Aufloesung hier immer aufs Signal gesetzt, auch wenn die Config kleiner
+    # will (z. B. aus einer alten Config-Datei).
+    if ((cfg['width'], cfg['height']) == (src['width'], src['height'])
             and 0 < cfg['framerate'] <= src['framerate']):
-        log(f'Signal {have[0]}x{have[1]}@{have[2]}, Ziel {want[0]}x{want[1]}'
-            f'@{want[2]} -- ISP skaliert herunter (Bandbreite sparen).')
+        log(f'Signal {have[0]}x{have[1]}@{have[2]}, Ziel @{cfg["framerate"]} '
+            f'-- videorate duennt aus (Bandbreite sparen).')
         return
     log(f'Signal liefert {have[0]}x{have[1]}@{have[2]}, Config wollte '
-        f'{want[0]}x{want[1]}@{want[2]} -- das Signal gewinnt. Mehr als das '
-        f'Signal geht nur an der HDMI-Quelle selbst; weniger per Auswahl im UI.')
-    cfg['width'], cfg['height'], cfg['framerate'] = have
+        f'{want[0]}x{want[1]}@{want[2]} -- das Signal gewinnt (nur die '
+        f'Bildrate darf reduziert werden, s. Kommentar).')
+    cfg['width'], cfg['height'] = have[0], have[1]
+    if not 0 < cfg['framerate'] <= src['framerate']:
+        cfg['framerate'] = have[2]
 
 
 def build_pipeline(cfg, src):
@@ -404,6 +413,10 @@ def build_pipeline(cfg, src):
     scale = ''
     if raw and fps < src['framerate']:
         scale += f'! videorate drop-only=true ! video/x-raw,framerate={fps}/1 '
+    # GEPARKT: dieser Zweig ist derzeit unerreichbar (adopt_geometry setzt die
+    # Aufloesung immer aufs Signal), weil der bcm2835-ISP im RTSP-Harness in
+    # einem Race haengen bleibt -- s. STATUS.md 14.08. Standalone lief exakt
+    # diese Kette; der Code bleibt fuer den naechsten Anlauf stehen.
     if raw and (width, height) != (src['width'], src['height']):
         scale += (f'! v4l2convert ! video/x-raw,width={width},height={height},'
                   f'pixel-aspect-ratio=1/1 ')

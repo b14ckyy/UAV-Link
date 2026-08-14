@@ -222,15 +222,12 @@ def device_formats(dev):
         rates = [fps]
         while rates[-1] // 2 >= 15:
             rates.append(rates[-1] // 2)
-        # Breite aus dem Seitenverhaeltnis des Signals, auf 16 gerundet
-        # (Encoder-Alignment): 1080p -> 1280x720 und 848x480; 720p -> 848x480.
-        formats = [{'width': w, 'height': h, 'fps': rates}]
-        for th in (720, 480):
-            if th >= h:
-                continue
-            tw = round(w * th / h / 16) * 16
-            formats.append({'width': tw, 'height': th, 'fps': rates})
-        return formats
+        # NUR die native Aufloesung. Auflosungs-Downscale (ISP) ist gebaut,
+        # aber GEPARKT: der bcm2835-ISP verklemmt sich im RTSP-Harness in
+        # einem Race (Job wird nie fertig, Pipeline haengt stumm) -- Details
+        # STATUS.md 14.08. CPU-Scaling ist keine Option (43 ms/Frame).
+        # Wieder anbieten, sobald das Race geloest ist.
+        return [{'width': w, 'height': h, 'fps': rates}]
     out = sh(['v4l2-ctl', '-d', dev, '--list-formats-ext'])
     formats, in_mjpg, size = [], False, None
     for line in out.splitlines():
@@ -949,9 +946,8 @@ function applySourceKind(kind, nFormats) {
   // Rohquelle enthaelt die Liste ohnehin nur den einen gueltigen Eintrag.
   if (!raw) { hint.textContent = ''; return; }
   hint.textContent = nFormats
-    ? 'HDMI input: the top entry is the incoming signal. Smaller entries are '
-      + 'downscaled in hardware (ISP) to save bandwidth — no CPU cost. For '
-      + 'more than the signal, change the source device.'
+    ? 'HDMI input: resolution follows the incoming signal (change it at the '
+      + 'source). The frame rate can be reduced here to save bandwidth.'
     : 'HDMI bridge detected, but no signal locked. Check that the source is '
       + 'powered and sending 720p60 or 1080p30 (the bridge cannot do 1080p60).';
 }
