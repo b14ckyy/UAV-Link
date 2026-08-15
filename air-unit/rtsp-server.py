@@ -565,9 +565,8 @@ class OsdEngine:
         except Exception as e:            # noqa: BLE001 -- Stream schuetzen
             log(f'OSD-Burn-in deaktiviert: {e}')
             return None
-        log(f'OSD-Burn-in aktiv: Zelle {eng.cell_w}x{eng.cell_h}, '
-            f'{eng.n_glyphs} Glyphen, {len(eng.pool)} opake + '
-            f'{len(eng.bval)} Saum-Bytes')
+        log('OSD-Burn-in aktiv: Zellgroesse adaptiv, wartet auf erstes '
+            'FC-Grid')
         return eng
 
     def __init__(self, width, height, fmt='UYVY'):
@@ -586,6 +585,12 @@ class OsdEngine:
         self._font_cell = None        # Zellgroesse, fuer die das PNG geladen ist
         self._layout = None           # (fmt, W, H, offsets, strides)
         self._meta_key = None         # zuletzt gesehene GstVideoMeta-Geometrie
+        self.grid_dims = None         # (rows, cols) des FC-Grids -- adaptiv
+        self.cell_w = self.cell_h = 0
+        self.glyphs = []
+        # Kompilieren (Listener- ODER Streaming-Thread) gegeneinander
+        # serialisieren; stamp() bleibt lock-frei ueber Tabellen-Snapshots.
+        self._cl = threading.Lock()
         self.tables = None            # opak:  (runs_ptr, n_runs, runs_ref)
         self.btables = None           # Saum: dito, Pools bval/balf parallel
         self._last_grid = None
@@ -619,27 +624,38 @@ class OsdEngine:
                       (off[2], sc, 1, vs, 1)]
         else:
             raise ValueError(f'OSD: Format {fmt} nicht unterstuetzt')
-        self.fmt, self.W, self.H, self.planes = fmt, W, H, planes
-        # Zellgroesse aus der Hoehe: 20 Zeilen fuellen das Bild exakt
-        # (720 -> 24x36, 1080 -> 36x54); Breite = 2/3 der Hoehe, auf
-        # gerade Werte gerundet (UYVY-Paare bzw. Chroma-Subsampling).
-        self.cell_h = H // 20
-        if fmt != 'UYVY':
-            # Chroma ist unterabgetastet: Zellhoehe (und in rebuild der
-            # Ursprung) muss gerade sein, sonst wandern die Farbsaeume.
-            self.cell_h &= ~1
-        # Breite: 2:3-Aspekt, aber so geklemmt, dass auch das breiteste Grid
-        # (53 Spalten, HD) sicher ins Bild passt -- sonst wird der Zentrier-
-        # Offset negativ und die Lauftabelle schreibt ausserhalb der Zeile
-        # (bei schmalen Signalen wie 640/720 Pixel Breite).
-        self.cell_w = min(self.cell_h * 2 // 3, W // 53) & ~1
-        self.tables = self.btables = None      # alte Offsets sind ungueltig
-        if (self.cell_w, self.cell_h) != self._font_cell:
+        with self._cl:
+            self.fmt, self.W, self.H, self.planes = fmt, W, H, planes
+            self.tables = self.btables = None  # alte Offsets sind ungueltig
+            if self.grid_dims:
+                self._set_cell()               # neu einbacken, Grid bekannt
+            self._layout = key
+            self._last_grid = None             # naechstes Grid baut neu
+        log(f'OSD-Layout: {fmt} {W}x{H}, Zelle '
+            + (f'{self.cell_w}x{self.cell_h}' if self.grid_dims
+               else 'folgt mit erstem FC-Grid'))
+
+    def _set_cell(self):
+        """Zellgroesse aus Bild UND Grid -- das Grid waehlt der User in INAV.
+
+        Hoehe: Grid-Zeilen fuellen das Bild exakt (HD-Grid 20 Zeilen bei
+        720p -> 36 px; SD-Grid 16 Zeilen bei 480p -> 30 px). Breite:
+        2:3-Aspekt, geklemmt auf die Spaltenzahl -- sonst wird der
+        Zentrier-Offset negativ und die Laeufe schreiben ausserhalb der
+        Zeile. Gerade Werte wegen UYVY-Paaren bzw. Chroma-Subsampling.
+        """
+        rows, cols = self.grid_dims
+        ch = self.H // rows
+        if self.fmt != 'UYVY':
+            ch &= ~1
+        cw = min(ch * 2 // 3, self.W // cols) & ~1
+        self.cell_w, self.cell_h = cw, ch
+        self.tables = self.btables = None
+        if (cw, ch) != self._font_cell:
             self._load_font()
         self._compile()
-        self._layout = key
-        self._last_grid = None                 # naechstes Grid baut neu
-        log(f'OSD-Layout: {fmt} {W}x{H}, Zelle {self.cell_w}x{self.cell_h}')
+        log(f'OSD-Zellen: {cw}x{ch} fuer Grid {cols}x{rows} '
+            f'auf {self.W}x{self.H}')
 
     def check_meta(self, meta):
         """GstVideoMeta gegen das angenommene Layout halten (Padding!)."""
@@ -852,6 +868,18 @@ class OsdEngine:
         key = (rows, cols, grid)
         if key == self._last_grid:
             return
+        with self._cl:
+            self._rebuild(rows, cols, grid, key)
+
+    def _rebuild(self, rows, cols, grid, key):
+        if not (0 < rows <= 32 and 0 < cols <= 64):
+            return
+        if (rows, cols) != self.grid_dims:
+            # Adaptive Zellgroesse: der FC bestimmt das Grid (HD 53x20,
+            # SD 30x16, ...) -- Wechsel backt Font + Fragmente neu ein
+            # (einmalig ~1 s, OSD ist waehrenddessen kurz weg).
+            self.grid_dims = (rows, cols)
+            self._set_cell()
         self._last_grid = key
         np = self.np
         # Canvas zentrieren (auch SD-Grids landen mittig im Bild); Ursprung
@@ -884,17 +912,21 @@ class OsdEngine:
                 if len(lens_b):
                     bparts.append((rel_b + base, src_b, lens_b))
 
-        def flatten(plist):
+        def flatten(plist, *pools):
+            # Snapshot-Tupel: Laeufe UND die dazugehoerigen Pool-Pointer
+            # derselben Compile-Generation -- stamp() liest lock-frei und
+            # darf nie neue Laeufe mit alten Pools mischen (oder umgekehrt).
             if not plist:
                 return None
             runs = np.ascontiguousarray(np.column_stack(
                 [np.concatenate([p[j] for p in plist]) for j in range(3)]
             ).astype(np.uint32).reshape(-1))
             return (runs.ctypes.data_as(self.ctypes.c_void_p),
-                    len(runs) // 3, runs)
+                    len(runs) // 3, runs) + pools
 
-        self.tables = flatten(parts)
-        self.btables = flatten(bparts)
+        self.tables = flatten(parts, self.pool_ptr, self.pool)
+        self.btables = flatten(bparts, self.bval_ptr, self.balf_ptr,
+                               self.bval, self.balf)
 
     def _start_listener(self):
         import socket
@@ -924,10 +956,10 @@ class OsdEngine:
         t0 = time.monotonic() if self._timing else 0.0
         t = self.tables
         if t:
-            self.lib.stamp(addr, self.pool_ptr, t[0], t[1])
+            self.lib.stamp(addr, t[3], t[0], t[1])
         b = self.btables
         if b:
-            self.lib.blend(addr, self.bval_ptr, self.balf_ptr, b[0], b[1])
+            self.lib.blend(addr, b[3], b[4], b[0], b[1])
         if self._timing:
             dt = time.monotonic() - t0
             self._tsum += dt
