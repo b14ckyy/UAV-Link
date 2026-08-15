@@ -603,15 +603,23 @@ class OsdEngine:
             row_mask[:, 1::4] = a
             row_mask[:, 2::4] = a | bm
             row_mask[:, 3::4] = bm
-            # Laeufe (zeilenweise zusammenhaengende opake Byte-Strecken)
-            flat = row_mask.reshape(-1)
+            # Laeufe (zeilenweise zusammenhaengende opake Byte-Strecken).
+            # Trennspalte zwischen den Zeilen, sonst verschmilzt ein Lauf am
+            # Zeilenende mit dem Zeilenanfang darunter und der memcpy schmiert
+            # horizontal aus der Zelle (sichtbar als Linie bei Vollbreite-
+            # Glyphen wie Crosshair/Horizont).
+            sep_mask = np.zeros((ch, cw * 2 + 1), dtype=bool)
+            sep_mask[:, :cw * 2] = row_mask
+            sep_bytes = np.zeros((ch, cw * 2 + 1), dtype=np.uint8)
+            sep_bytes[:, :cw * 2] = row_bytes
+            flat = sep_mask.reshape(-1)
             padded = np.concatenate(([False], flat, [False]))
             d = np.diff(padded.astype(np.int8))
             starts = np.flatnonzero(d == 1)
             lens = (np.flatnonzero(d == -1) - starts).astype(np.uint32)
-            gbytes = row_bytes.reshape(-1)[flat]
-            rows_of = starts // (cw * 2)
-            xs = starts % (cw * 2)
+            gbytes = sep_bytes.reshape(-1)[flat]
+            rows_of = starts // (cw * 2 + 1)
+            xs = starts % (cw * 2 + 1)
             rel = (rows_of * (self.W * 2) + xs).astype(np.uint32)
             src = (pool_off
                    + np.concatenate(([0], np.cumsum(lens[:-1])))

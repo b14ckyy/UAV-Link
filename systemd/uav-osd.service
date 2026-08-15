@@ -4,6 +4,8 @@ After=local-fs.target
 
 [Service]
 User=__UAVLINK_USER__
+# /run ist root-only -- systemd legt /run/uav-osd/ user-beschreibbar an
+RuntimeDirectory=uav-osd
 ExecStart=/usr/bin/python3 __UAVLINK_DIR__/uav-osd.py
 # Beendet sich mit Exit 0, wenn osd.enabled aus ist -- das Web-UI togglet
 # per systemctl restart (Config schreiben, restart, fertig).

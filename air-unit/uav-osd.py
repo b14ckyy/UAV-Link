@@ -19,7 +19,7 @@ Baud ist bewusst NICHT im UI: der Port haengt fest am FC; 115200 traegt
 HD-DisplayPort in der Praxis. Wie beim Recorder gilt: enabled=false ->
 Exit 0, das Web-UI togglet per systemctl restart.
 
-Status nach /run/uav-osd.status (JSON) fuers Web-UI.
+Status nach /run/uav-osd/status (JSON) fuers Web-UI.
 """
 import json
 import os
@@ -31,7 +31,7 @@ import time
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, 'config.json')
-STATUS_PATH = '/run/uav-osd.status'
+STATUS_PATH = '/run/uav-osd/status'
 OSD_UDP_PORT = 5761
 
 # MSP-DisplayPort-Subkommandos (Betaflight/INAV displayport_msp)
@@ -42,6 +42,15 @@ DP_WRITE = 3
 DP_DRAW = 4
 DP_OPTIONS = 5
 MSP_DISPLAYPORT = 182
+MSP_FC_VARIANT = 2
+
+# INAV sendet DisplayPort nur bei aktivem vtxActive-Gate: die Gegenseite muss
+# binnen 1 s irgendein MSP-Kommando geschickt haben (displayport_msp_osd.c,
+# VTX_TIMEOUT 1000 ms). Darum pollen wir wie HDZero/Walksnail zyklisch.
+POLL_INTERVAL = 0.5
+# MSPv1-Request '$M<' len=0: Checksumme = 0 ^ cmd = cmd
+POLL_FRAME = bytes([ord('$'), ord('M'), ord('<'), 0,
+                    MSP_FC_VARIANT, MSP_FC_VARIANT])
 
 GRIDS = {0: (16, 30), 1: (18, 50), 2: (20, 53), 3: (20, 53)}
 DEFAULT_GRID = (20, 53)
@@ -207,6 +216,8 @@ def main():
     parser = MspParser()
     fd = None
     last_status = 0.0
+    last_poll = 0.0
+    fc_variant = None
     draws_window = []
 
     log(f'MSP-DisplayPort-Reader: {dev} @ {baud}')
@@ -220,8 +231,17 @@ def main():
                               'error': str(e)})
                 time.sleep(3)
                 continue
-        r, _, _ = select.select([fd], [], [], 1.0)
+        r, _, _ = select.select([fd], [], [], 0.5)
         now = time.monotonic()
+        if now - last_poll >= POLL_INTERVAL:
+            last_poll = now
+            try:
+                os.write(fd, POLL_FRAME)
+            except OSError:
+                os.close(fd)
+                fd = None
+                log('UART-Schreibfehler -- neu verbinden')
+                continue
         if r:
             try:
                 data = os.read(fd, 4096)
@@ -234,6 +254,9 @@ def main():
                 continue
             state.last_frame = now
             for func, payload in parser.feed(data):
+                if func == MSP_FC_VARIANT and payload and fc_variant is None:
+                    fc_variant = payload.decode('ascii', 'replace')
+                    log(f'FC erkannt: {fc_variant}')
                 if func != MSP_DISPLAYPORT or not payload:
                     continue
                 sub = payload[0]
@@ -260,6 +283,7 @@ def main():
                 'grid': f'{state.cols}x{state.rows}',
                 'draw_hz': round(len(draws_window) / 5.0, 1),
                 'mode': osd.get('mode', 'burnin'),
+                'fc': fc_variant,
             })
 
 

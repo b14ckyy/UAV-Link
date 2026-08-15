@@ -478,9 +478,9 @@ OSD_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def osd_status():
-    """Zustand des OSD-Readers aus /run/uav-osd.status (JSON)."""
+    """Zustand des OSD-Readers aus /run/uav-osd/status (JSON)."""
     try:
-        with open('/run/uav-osd.status') as f:
+        with open('/run/uav-osd/status') as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
