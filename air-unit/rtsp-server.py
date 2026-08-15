@@ -423,7 +423,8 @@ def build_pipelines(cfg, src):
     source = f'v4l2src device={src["dev"]} ! {caps} '
     decode = '' if raw else '! jpegdec max-errors=-1 '
     # OSD-Burn-in: nach videorate/Scale (weniger Frames zu stanzen), direkt
-    # vor dem Encoder. Nur wenn die Engine aktiv ist (Rohquelle, Font da).
+    # vor dem Encoder. Nur wenn die Engine aktiv ist (Rohquelle oder
+    # dekodiertes MJPEG, Font da; im Passthrough gibt es kein Rohbild).
     # Die queue dahinter entkoppelt Stanzen und Encoder in eigene Threads
     # (sonst serialisiert der Streaming-Thread beides: gemessen kostete
     # jede Stanz-Millisekunde ~3 fps). max-size-buffers=2 haelt die
@@ -518,10 +519,12 @@ def build_pipelines(cfg, src):
 #   osdstamp     (GstBase-Element) ruft pro Frame einmal libosdstamp.so:
 #                memcpy der Laeufe in den Framebuffer. Gemessen 15.08.:
 #                0,83 ms/Frame fuer ein 162-Zellen-OSD, 720p60 gehalten.
-# Kein Alpha-Mixing, kein Frame-LESEN (DMA-Puffer sind uncached, ~125 MB/s
-# lesend -- Read-Modify-Write ist auf dieser Plattform tot, s. STATUS 15.08.).
-# Vorerst nur Rohquellen (UYVY); der MJPEG-Pfad (I420 nach jpegdec) braucht
-# eigene planare Lauftabellen -- TODO, wenn Bedarf besteht.
+# Frame-LESEN nur fuer die Saumbytes (DMA-Puffer sind uncached, ~125 MB/s
+# lesend -- s. STATUS 15.08.; nach jpegdec liegt dagegen gecachter System-
+# speicher an, dort ist das Blending fast gratis).
+# Unterstuetzte Formate: UYVY (CSI/Dongle roh, interleavte Laeufe) sowie
+# I420/Y42B (MJPEG nach jpegdec bzw. YU12-Quellen): drei Planes, je eigene
+# Laeufe -- dieselben C-Funktionen, die dst-Offsets zeigen in die Plane.
 OSD_UDP_PORT = 5761
 FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'fonts', 'osd-font.png')
@@ -537,14 +540,28 @@ class OsdEngine:
         osd = cfg.get('osd') or {}
         if not (osd.get('enabled') and osd.get('mode', 'burnin') == 'burnin'):
             return None
-        if src['kind'] != 'raw' or src.get('fmt') != 'UYVY':
-            log('OSD-Burn-in: nur fuer Rohquellen (UYVY) -- uebersprungen')
+        if src['kind'] == 'raw':
+            fmt = src.get('fmt')
+            if fmt not in ('UYVY', 'I420'):
+                log(f'OSD-Burn-in: Rohformat {fmt} nicht unterstuetzt -- '
+                    f'uebersprungen')
+                return None
+        elif src['kind'] == 'mjpeg':
+            if cfg.get('codec') == 'mjpeg-src':
+                log('OSD-Burn-in: MJPEG-Passthrough hat kein Rohbild -- '
+                    'uebersprungen')
+                return None
+            # jpegdec liefert planar: I420 bei 4:2:0-JPEGs, Y42B bei 4:2:2.
+            # Annahme I420; weicht die Aushandlung ab, zieht set_caps nach.
+            fmt = 'I420'
+        else:
+            log('OSD-Burn-in: Quellart unbekannt -- uebersprungen')
             return None
         if not os.path.exists(FONT_PATH):
             log('OSD-Burn-in: kein Font hochgeladen -- uebersprungen')
             return None
         try:
-            eng = OsdEngine(cfg['width'], cfg['height'])
+            eng = OsdEngine(cfg['width'], cfg['height'], fmt)
         except Exception as e:            # noqa: BLE001 -- Stream schuetzen
             log(f'OSD-Burn-in deaktiviert: {e}')
             return None
@@ -553,20 +570,10 @@ class OsdEngine:
             f'{len(eng.bval)} Saum-Bytes')
         return eng
 
-    def __init__(self, width, height):
+    def __init__(self, width, height, fmt='UYVY'):
         import ctypes
         import numpy as np
         self.np = np
-        self.W, self.H = width, height
-        # Zellgroesse aus der Hoehe: 20 Zeilen fuellen das Bild exakt
-        # (720 -> 24x36, 1080 -> 36x54); Breite = 2/3 der Hoehe, auf
-        # gerade Werte gerundet (UYVY-Paar-Alignment).
-        self.cell_h = height // 20
-        # Breite: 2:3-Aspekt, aber so geklemmt, dass auch das breiteste Grid
-        # (53 Spalten, HD) sicher ins Bild passt -- sonst wird der Zentrier-
-        # Offset negativ und die Lauftabelle schreibt ausserhalb der Zeile
-        # (bei schmalen Signalen wie 640/720 Pixel Breite).
-        self.cell_w = min(self.cell_h * 2 // 3, width // 53) & ~1
         lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'libosdstamp.so')
         self.lib = ctypes.CDLL(lib_path)
@@ -576,7 +583,9 @@ class OsdEngine:
                                    ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_uint32]
         self.ctypes = ctypes
-        self._load_font()
+        self._font_cell = None        # Zellgroesse, fuer die das PNG geladen ist
+        self._layout = None           # (fmt, W, H, offsets, strides)
+        self._meta_key = None         # zuletzt gesehene GstVideoMeta-Geometrie
         self.tables = None            # opak:  (runs_ptr, n_runs, runs_ref)
         self.btables = None           # Saum: dito, Pools bval/balf parallel
         self._last_grid = None
@@ -584,7 +593,68 @@ class OsdEngine:
         self._timing = bool(os.environ.get('UAV_OSD_TIMING'))
         self._tsum = self._tmax = 0.0
         self._tn = 0
+        self.set_layout(fmt, width, height)
         self._start_listener()
+
+    # --- Bildlayout: Format/Geometrie -> Planes -------------------------------
+    def set_layout(self, fmt, W, H, offsets=None, strides=None):
+        """Planes als (byte_offset, stride, hshift, vshift, bytes/px).
+
+        UYVY ist eine interleavte "Plane"; bei I420/Y42B bekommen Y/U/V
+        eigene Laeufe. offsets/strides kommen aus GstVideoMeta, wenn der
+        Puffer gepolstert ist -- sonst dichtgepackte Annahme.
+        """
+        key = (fmt, W, H, tuple(offsets or ()), tuple(strides or ()))
+        if key == self._layout:
+            return
+        if fmt == 'UYVY':
+            s0 = strides[0] if strides else W * 2
+            planes = [((offsets or (0,))[0], s0, 0, 0, 2)]
+        elif fmt in ('I420', 'Y42B'):
+            vs = 1 if fmt == 'I420' else 0    # Chroma vertikal halbiert?
+            sy, sc = (strides[0], strides[1]) if strides else (W, W // 2)
+            off = offsets or (0, sy * H, sy * H + sc * (H >> vs))
+            planes = [(off[0], sy, 0, 0, 1),
+                      (off[1], sc, 1, vs, 1),
+                      (off[2], sc, 1, vs, 1)]
+        else:
+            raise ValueError(f'OSD: Format {fmt} nicht unterstuetzt')
+        self.fmt, self.W, self.H, self.planes = fmt, W, H, planes
+        # Zellgroesse aus der Hoehe: 20 Zeilen fuellen das Bild exakt
+        # (720 -> 24x36, 1080 -> 36x54); Breite = 2/3 der Hoehe, auf
+        # gerade Werte gerundet (UYVY-Paare bzw. Chroma-Subsampling).
+        self.cell_h = H // 20
+        if fmt != 'UYVY':
+            # Chroma ist unterabgetastet: Zellhoehe (und in rebuild der
+            # Ursprung) muss gerade sein, sonst wandern die Farbsaeume.
+            self.cell_h &= ~1
+        # Breite: 2:3-Aspekt, aber so geklemmt, dass auch das breiteste Grid
+        # (53 Spalten, HD) sicher ins Bild passt -- sonst wird der Zentrier-
+        # Offset negativ und die Lauftabelle schreibt ausserhalb der Zeile
+        # (bei schmalen Signalen wie 640/720 Pixel Breite).
+        self.cell_w = min(self.cell_h * 2 // 3, W // 53) & ~1
+        self.tables = self.btables = None      # alte Offsets sind ungueltig
+        if (self.cell_w, self.cell_h) != self._font_cell:
+            self._load_font()
+        self._compile()
+        self._layout = key
+        self._last_grid = None                 # naechstes Grid baut neu
+        log(f'OSD-Layout: {fmt} {W}x{H}, Zelle {self.cell_w}x{self.cell_h}')
+
+    def check_meta(self, meta):
+        """GstVideoMeta gegen das angenommene Layout halten (Padding!)."""
+        n = meta.n_planes
+        key = (tuple(meta.offset[:n]), tuple(meta.stride[:n]))
+        if key == self._meta_key:
+            return
+        self._meta_key = key
+        self.set_layout(self.fmt, self.W, self.H,
+                        offsets=key[0], strides=key[1])
+
+    def caps_string(self):
+        if self.fmt == 'UYVY':
+            return 'video/x-raw,format=UYVY'
+        return 'video/x-raw,format={ I420, Y42B }'
 
     def _fill_gaps(self, mask, g):
         """True-Luecken <= g Bytes je Zeile schliessen (vektorisiert)."""
@@ -599,7 +669,7 @@ class OsdEngine:
         nxt = (n - 1) - nxt[:, ::-1]
         return mask | ((nxt - last) <= g + 1)
 
-    # --- Font: PNG -> pro Glyphe UYVY-Bytes + Lauf-Fragmente ------------------
+    # --- Font: PNG -> YUV+Alpha in Zellaufloesung -----------------------------
     def _load_font(self):
         import gi
         gi.require_version('GdkPixbuf', '2.0')
@@ -627,98 +697,144 @@ class OsdEngine:
         r = img[:, :, 0].astype(np.int32)
         g = img[:, :, 1].astype(np.int32)
         b = img[:, :, 2].astype(np.int32)
-        aa = img[:, :, 3].astype(np.int32)
         yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16
-        uu = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128
-        vv = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128
+        self._yy = np.clip(yy, 16, 235).astype(np.uint8)
+        self._uu = (((-38 * r - 74 * g + 112 * b + 128) >> 8)
+                    + 128).astype(np.uint8)
+        self._vv = (((112 * r - 94 * g - 18 * b + 128) >> 8)
+                    + 128).astype(np.uint8)
+        self._aa = img[:, :, 3].copy()
+        self._font_cell = (self.cell_w, self.cell_h)
+
+    # --- Glyphen: Pixel -> Lauf-Fragmente fuers aktuelle Layout ---------------
+    def _compile(self):
+        np = self.np
         cw, ch = self.cell_w, self.cell_h
 
         # Drei Alpha-Klassen pro BYTE: opak (memcpy-Lauf), Saum (Blend-Lauf
         # mit echtem Alpha -- macht die vom Skalieren angefressenen Outlines
-        # wieder weich), unsichtbar. Blend liest den Framebuffer (uncached!),
-        # bleibt aber billig, weil nur der schmale Saum betroffen ist.
+        # wieder weich), unsichtbar. Blend liest den Framebuffer (am CSI-Pfad
+        # uncached!), bleibt aber billig, weil nur der schmale Saum betroffen
+        # ist.
         A_OPAQUE, A_MIN = 224, 32
 
-        def runs_from(mask, *layers):
+        def runs_from(mask, dst_stride, *layers):
             # Zeilenweise Laeufe; Trennspalte, sonst verschmilzt ein Lauf am
             # Zeilenende mit dem Zeilenanfang darunter und der memcpy
             # schmiert horizontal aus der Zelle (Linie bei Vollbreite-
             # Glyphen wie Crosshair/Horizont).
-            sep = np.zeros((ch, cw * 2 + 1), dtype=bool)
-            sep[:, :cw * 2] = mask
+            hh, ww = mask.shape
+            sep = np.zeros((hh, ww + 1), dtype=bool)
+            sep[:, :ww] = mask
             flat = sep.reshape(-1)
             padded = np.concatenate(([False], flat, [False]))
             d = np.diff(padded.astype(np.int8))
             starts = np.flatnonzero(d == 1)
             lens = (np.flatnonzero(d == -1) - starts).astype(np.uint32)
-            rel = ((starts // (cw * 2 + 1)) * (self.W * 2)
-                   + starts % (cw * 2 + 1)).astype(np.uint32)
+            rel = ((starts // (ww + 1)) * dst_stride
+                   + starts % (ww + 1)).astype(np.uint32)
             out = []
             for lay in layers:
-                sepb = np.zeros((ch, cw * 2 + 1), dtype=np.uint8)
-                sepb[:, :cw * 2] = lay
+                sepb = np.zeros((hh, ww + 1), dtype=np.uint8)
+                sepb[:, :ww] = lay
                 out.append(sepb.reshape(-1)[flat])
             return rel, lens, out
 
-        pool = []                     # opake UYVY-Bytes, alle Glyphen
+        pool = []                     # opake Bytes, alle Glyphen/Planes
         bval, balf = [], []           # Saum: Wert- und Alpha-Bytes, parallel
-        pool_off = boff = 0
-        # pro Glyphe: (rel, src, lens, rel_b, src_b, lens_b) oder None
-        self.glyphs = []
-        for idx in range(512):
-            gx, gy = (idx // 256) * cw, (idx % 256) * ch
-            ga = aa[gy:gy + ch, gx:gx + cw]
-            if not (ga >= A_MIN).any():
-                self.glyphs.append(None)
-                continue
-            gy_, gu, gv = (yy[gy:gy + ch, gx:gx + cw],
-                           uu[gy:gy + ch, gx:gx + cw],
-                           vv[gy:gy + ch, gx:gx + cw])
-            # UYVY-Zeile: pro Pixelpaar [U, Y0, V, Y1]. Chroma = alpha-
-            # gewichtetes Mittel des Paars (ein transparenter Nachbar ist
-            # meist schwarz und wuerde die Farbe sonst verfaelschen);
-            # Chroma-Alpha = Mittel der Paar-Alphas.
-            a0, a1 = ga[:, 0::2], ga[:, 1::2]
-            asum = np.maximum(a0 + a1, 1)
-            u_pair = ((gu[:, 0::2] * a0 + gu[:, 1::2] * a1)
-                      // asum).astype(np.uint8)
-            v_pair = ((gv[:, 0::2] * a0 + gv[:, 1::2] * a1)
-                      // asum).astype(np.uint8)
-            a_pair = (a0 + a1) // 2
-            row_bytes = np.zeros((ch, cw * 2), dtype=np.uint8)
-            row_alpha = np.zeros((ch, cw * 2), dtype=np.uint8)
-            row_bytes[:, 0::4] = u_pair
-            row_bytes[:, 1::4] = np.clip(gy_[:, 0::2], 16, 235)
-            row_bytes[:, 2::4] = v_pair
-            row_bytes[:, 3::4] = np.clip(gy_[:, 1::2], 16, 235)
-            row_alpha[:, 0::4] = a_pair
-            row_alpha[:, 1::4] = a0
-            row_alpha[:, 2::4] = a_pair
-            row_alpha[:, 3::4] = a1
-            m_op = row_alpha >= A_OPAQUE
-            m_bl = (row_alpha >= A_MIN) & ~m_op
-            # Saumlaeufe sind einzeln nur wenige Bytes lang; jede uncached-
-            # Lesetransaktion kostet aber ~500 ns Latenz (gemessen: 8400
-            # Einzellaeufe = 4,8 ms/Frame). Darum Luecken <= 24 B zwischen
-            # Saumstuecken einer Zeile MIT aufnehmen: opake Kerne blenden
-            # zu ihrem eigenen Wert (No-Op), Hintergrund hat Alpha ~0
-            # (Identitaet) -- wenige lange Reads statt vieler kurzer.
-            m_bl = self._fill_gaps(m_bl, 24)
+        offs = {'pool': 0, 'blend': 0}
 
-            rel, lens, (gbytes,) = runs_from(m_op, row_bytes)
-            src = (pool_off + np.concatenate(([0], np.cumsum(lens)))
+        def fragment(values, alphas, dst_stride, gap):
+            """Ein Plane-Fragment: opake + Saumlaeufe aus Wert/Alpha-Zellen.
+
+            Saumlaeufe sind einzeln nur wenige Bytes lang; jede uncached-
+            Lesetransaktion kostet aber ~500 ns Latenz (gemessen: 8400
+            Einzellaeufe = 4,8 ms/Frame). Darum Luecken <= gap Bytes
+            zwischen Saumstuecken einer Zeile MIT aufnehmen: opake Kerne
+            blenden zu ihrem eigenen Wert (No-Op), Hintergrund hat Alpha ~0
+            (Identitaet) -- wenige lange Reads statt vieler kurzer.
+            """
+            m_op = alphas >= A_OPAQUE
+            m_bl = self._fill_gaps((alphas >= A_MIN) & ~m_op, gap)
+            rel, lens, (gbytes,) = runs_from(m_op, dst_stride, values)
+            src = (offs['pool'] + np.concatenate(([0], np.cumsum(lens)))
                    )[:len(lens)].astype(np.uint32)
             pool.append(gbytes)
-            pool_off += len(gbytes)
-
-            rel_b, lens_b, (bb, ba) = runs_from(m_bl, row_bytes, row_alpha)
-            src_b = (boff + np.concatenate(([0], np.cumsum(lens_b)))
+            offs['pool'] += len(gbytes)
+            rel_b, lens_b, (bb, ba) = runs_from(m_bl, dst_stride,
+                                                values, alphas)
+            src_b = (offs['blend'] + np.concatenate(([0], np.cumsum(lens_b)))
                      )[:len(lens_b)].astype(np.uint32)
             bval.append(bb)
             balf.append(ba)
-            boff += len(bb)
+            offs['blend'] += len(bb)
+            return rel, src, lens, rel_b, src_b, lens_b
 
-            self.glyphs.append((rel, src, lens, rel_b, src_b, lens_b))
+        # pro Glyphe: Liste von Fragmenten (eins je Plane) oder None
+        glyphs = []
+        for idx in range(512):
+            gx, gy0 = (idx // 256) * cw, (idx % 256) * ch
+            ga = self._aa[gy0:gy0 + ch, gx:gx + cw].astype(np.int32)
+            if not (ga >= A_MIN).any():
+                glyphs.append(None)
+                continue
+            gy = self._yy[gy0:gy0 + ch, gx:gx + cw]
+            gu = self._uu[gy0:gy0 + ch, gx:gx + cw].astype(np.int32)
+            gv = self._vv[gy0:gy0 + ch, gx:gx + cw].astype(np.int32)
+            if self.fmt == 'UYVY':
+                # UYVY-Zeile: pro Pixelpaar [U, Y0, V, Y1]. Chroma = alpha-
+                # gewichtetes Mittel des Paars (ein transparenter Nachbar ist
+                # meist schwarz und wuerde die Farbe sonst verfaelschen);
+                # Chroma-Alpha = Mittel der Paar-Alphas.
+                a0, a1 = ga[:, 0::2], ga[:, 1::2]
+                asum = np.maximum(a0 + a1, 1)
+                u_pair = ((gu[:, 0::2] * a0 + gu[:, 1::2] * a1)
+                          // asum).astype(np.uint8)
+                v_pair = ((gv[:, 0::2] * a0 + gv[:, 1::2] * a1)
+                          // asum).astype(np.uint8)
+                a_pair = (a0 + a1) // 2
+                row_bytes = np.zeros((ch, cw * 2), dtype=np.uint8)
+                row_alpha = np.zeros((ch, cw * 2), dtype=np.uint8)
+                row_bytes[:, 0::4] = u_pair
+                row_bytes[:, 1::4] = gy[:, 0::2]
+                row_bytes[:, 2::4] = v_pair
+                row_bytes[:, 3::4] = gy[:, 1::2]
+                row_alpha[:, 0::4] = a_pair
+                row_alpha[:, 1::4] = a0
+                row_alpha[:, 2::4] = a_pair
+                row_alpha[:, 3::4] = a1
+                frags = [fragment(row_bytes, row_alpha,
+                                  self.planes[0][1], 24)]
+            else:
+                # Planar: Y in voller Aufloesung, Chroma alpha-gewichtet auf
+                # den Subsampling-Block gemittelt (2x2 bei I420, 2x1 bei
+                # Y42B). Gap-Schwellen halbiert: 1 Byte/px statt 2.
+                if self.planes[1][3]:            # vshift -> 2x2-Block
+                    a_blk = (ga[0::2, 0::2] + ga[0::2, 1::2]
+                             + ga[1::2, 0::2] + ga[1::2, 1::2])
+
+                    def blk(x):
+                        return (x[0::2, 0::2] * ga[0::2, 0::2]
+                                + x[0::2, 1::2] * ga[0::2, 1::2]
+                                + x[1::2, 0::2] * ga[1::2, 0::2]
+                                + x[1::2, 1::2] * ga[1::2, 1::2])
+                    n_blk = 4
+                else:                            # 2x1-Paar (Y42B)
+                    a_blk = ga[:, 0::2] + ga[:, 1::2]
+
+                    def blk(x):
+                        return x[:, 0::2] * ga[:, 0::2] + x[:, 1::2] * ga[:, 1::2]
+                    n_blk = 2
+                asum = np.maximum(a_blk, 1)
+                u_c = (blk(gu) // asum).astype(np.uint8)
+                v_c = (blk(gv) // asum).astype(np.uint8)
+                a_c = (a_blk // n_blk).astype(np.uint8)
+                frags = [
+                    fragment(gy, ga.astype(np.uint8), self.planes[0][1], 12),
+                    fragment(u_c, a_c, self.planes[1][1], 6),
+                    fragment(v_c, a_c, self.planes[2][1], 6),
+                ]
+            glyphs.append(frags)
         z = np.zeros(0, dtype=np.uint8)
         self.pool = np.ascontiguousarray(np.concatenate(pool or [z]))
         self.bval = np.ascontiguousarray(np.concatenate(bval or [z]))
@@ -726,7 +842,8 @@ class OsdEngine:
         self.pool_ptr = self.pool.ctypes.data_as(self.ctypes.c_void_p)
         self.bval_ptr = self.bval.ctypes.data_as(self.ctypes.c_void_p)
         self.balf_ptr = self.balf.ctypes.data_as(self.ctypes.c_void_p)
-        self.n_glyphs = sum(1 for g in self.glyphs if g is not None)
+        self.glyphs = glyphs
+        self.n_glyphs = sum(1 for g in glyphs if g is not None)
 
     # --- Grid-Paket -> flache Lauftabelle -------------------------------------
     def rebuild(self, rows, cols, grid):
@@ -737,9 +854,12 @@ class OsdEngine:
             return
         self._last_grid = key
         np = self.np
-        # Canvas zentrieren (auch SD-Grids landen mittig im Bild)
+        # Canvas zentrieren (auch SD-Grids landen mittig im Bild); Ursprung
+        # gerade halten (UYVY-Paare bzw. Chroma-Subsampling-Raster).
         x0 = (self.W - cols * self.cell_w) // 2 & ~1
         y0 = (self.H - rows * self.cell_h) // 2
+        if self.fmt != 'UYVY':
+            y0 &= ~1
         if x0 < 0 or y0 < 0:
             # Grid passt nicht ins Bild -- lieber kein OSD als korrupte
             # Laeufe ausserhalb der Zeilen (zerrissenes Bild).
@@ -753,13 +873,16 @@ class OsdEngine:
             if g is None:
                 continue
             r, c = divmod(i, cols)
-            base = np.uint32((y0 + r * self.cell_h) * self.W * 2
-                             + (x0 + c * self.cell_w) * 2)
-            rel, src, lens, rel_b, src_b, lens_b = g
-            if len(lens):
-                parts.append((rel + base, src, lens))
-            if len(lens_b):
-                bparts.append((rel_b + base, src_b, lens_b))
+            px = x0 + c * self.cell_w
+            py = y0 + r * self.cell_h
+            for (off, stride, hs, vs, bpp), frag in zip(self.planes, g):
+                base = np.uint32(off + (py >> vs) * stride
+                                 + (px >> hs) * bpp)
+                rel, src, lens, rel_b, src_b, lens_b = frag
+                if len(lens):
+                    parts.append((rel + base, src, lens))
+                if len(lens_b):
+                    bparts.append((rel_b + base, src_b, lens_b))
 
         def flatten(plist):
             if not plist:
@@ -822,9 +945,10 @@ def register_osd_element(engine):
     """osdstamp-Element registrieren (einmalig, vor dem Pipeline-Parse)."""
     import gi
     gi.require_version('GstBase', '1.0')
-    from gi.repository import GstBase, GObject
+    gi.require_version('GstVideo', '1.0')
+    from gi.repository import GstBase, GstVideo, GObject
 
-    caps = Gst.Caps.from_string('video/x-raw,format=UYVY')
+    caps = Gst.Caps.from_string(engine.caps_string())
 
     class OsdStamp(GstBase.BaseTransform):
         __gstmetadata__ = ('osdstamp', 'Filter/Video',
@@ -836,8 +960,26 @@ def register_osd_element(engine):
                                 Gst.PadPresence.ALWAYS, caps),
         )
 
+        def do_set_caps(self, incaps, outcaps):
+            # Ausgehandeltes Format uebernehmen (z. B. Y42B statt I420,
+            # wenn die Kamera 4:2:2-JPEGs liefert).
+            try:
+                s = incaps.get_structure(0)
+                engine.set_layout(s.get_string('format'),
+                                  s.get_value('width'),
+                                  s.get_value('height'))
+            except Exception as e:   # noqa: BLE001 -- Stream schuetzen
+                log(f'osdstamp set_caps: {e}')
+            return True
+
         def do_transform_ip(self, buf):
             try:
+                # Gepolsterte Puffer (Stride/Offset laut Meta != dicht
+                # gepackt) einmalig ins Layout uebernehmen -- sonst
+                # schreiben die Laeufe an die falschen Stellen.
+                meta = GstVideo.buffer_get_video_meta(buf)
+                if meta is not None:
+                    engine.check_meta(meta)
                 ok, m = buf.map(Gst.MapFlags.READ | Gst.MapFlags.WRITE)
                 if ok:
                     cbuf = (engine.ctypes.c_ubyte * m.size).from_buffer(m.data)
