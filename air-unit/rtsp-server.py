@@ -413,7 +413,11 @@ def build_pipeline(cfg, src):
     decode = '' if raw else '! jpegdec max-errors=-1 '
     # OSD-Burn-in: nach videorate/Scale (weniger Frames zu stanzen), direkt
     # vor dem Encoder. Nur wenn die Engine aktiv ist (Rohquelle, Font da).
-    osd = '! osdstamp ' if OSD_ENGINE else ''
+    # Die queue dahinter entkoppelt Stanzen und Encoder in eigene Threads
+    # (sonst serialisiert der Streaming-Thread beides: gemessen kostete
+    # jede Stanz-Millisekunde ~3 fps). max-size-buffers=2 haelt die
+    # Zusatzlatenz bei maximal einem Frame.
+    osd = '! osdstamp ! queue max-size-buffers=2 ' if OSD_ENGINE else ''
     scale = ''
     if raw and fps < src['framerate']:
         scale += f'! videorate drop-only=true ! video/x-raw,framerate={fps}/1 '
@@ -519,7 +523,8 @@ class OsdEngine:
             log(f'OSD-Burn-in deaktiviert: {e}')
             return None
         log(f'OSD-Burn-in aktiv: Zelle {eng.cell_w}x{eng.cell_h}, '
-            f'{eng.n_glyphs} Glyphen')
+            f'{eng.n_glyphs} Glyphen, {len(eng.pool)} opake + '
+            f'{len(eng.bval)} Saum-Bytes')
         return eng
 
     def __init__(self, width, height):
@@ -541,10 +546,32 @@ class OsdEngine:
         self.lib = ctypes.CDLL(lib_path)
         self.lib.stamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_void_p, ctypes.c_uint32]
+        self.lib.blend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_uint32]
         self.ctypes = ctypes
         self._load_font()
-        self.tables = None            # (runs_ptr, n_runs, runs_ref)
+        self.tables = None            # opak:  (runs_ptr, n_runs, runs_ref)
+        self.btables = None           # Saum: dito, Pools bval/balf parallel
+        self._last_grid = None
+        # Timing-Diagnose (UAV_OSD_TIMING=1 in der Service-Umgebung)
+        self._timing = bool(os.environ.get('UAV_OSD_TIMING'))
+        self._tsum = self._tmax = 0.0
+        self._tn = 0
         self._start_listener()
+
+    def _fill_gaps(self, mask, g):
+        """True-Luecken <= g Bytes je Zeile schliessen (vektorisiert)."""
+        np = self.np
+        n = mask.shape[1]
+        idx = np.arange(n)
+        big = n + g + 1
+        last = np.where(mask, idx, -big)          # letzter True links von i
+        np.maximum.accumulate(last, axis=1, out=last)
+        nxt = np.where(mask[:, ::-1], idx, -big)  # naechster True rechts
+        np.maximum.accumulate(nxt, axis=1, out=nxt)
+        nxt = (n - 1) - nxt[:, ::-1]
+        return mask | ((nxt - last) <= g + 1)
 
     # --- Font: PNG -> pro Glyphe UYVY-Bytes + Lauf-Fragmente ------------------
     def _load_font(self):
@@ -574,69 +601,115 @@ class OsdEngine:
         r = img[:, :, 0].astype(np.int32)
         g = img[:, :, 1].astype(np.int32)
         b = img[:, :, 2].astype(np.int32)
-        opaque = img[:, :, 3] >= 128
+        aa = img[:, :, 3].astype(np.int32)
         yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16
         uu = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128
         vv = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128
         cw, ch = self.cell_w, self.cell_h
-        pool = []                     # globaler Byte-Pool ueber alle Glyphen
-        pool_off = 0
-        self.glyphs = []              # pro Glyphe: (rel_dst, src, laengen)
+
+        # Drei Alpha-Klassen pro BYTE: opak (memcpy-Lauf), Saum (Blend-Lauf
+        # mit echtem Alpha -- macht die vom Skalieren angefressenen Outlines
+        # wieder weich), unsichtbar. Blend liest den Framebuffer (uncached!),
+        # bleibt aber billig, weil nur der schmale Saum betroffen ist.
+        A_OPAQUE, A_MIN = 224, 32
+
+        def runs_from(mask, *layers):
+            # Zeilenweise Laeufe; Trennspalte, sonst verschmilzt ein Lauf am
+            # Zeilenende mit dem Zeilenanfang darunter und der memcpy
+            # schmiert horizontal aus der Zelle (Linie bei Vollbreite-
+            # Glyphen wie Crosshair/Horizont).
+            sep = np.zeros((ch, cw * 2 + 1), dtype=bool)
+            sep[:, :cw * 2] = mask
+            flat = sep.reshape(-1)
+            padded = np.concatenate(([False], flat, [False]))
+            d = np.diff(padded.astype(np.int8))
+            starts = np.flatnonzero(d == 1)
+            lens = (np.flatnonzero(d == -1) - starts).astype(np.uint32)
+            rel = ((starts // (cw * 2 + 1)) * (self.W * 2)
+                   + starts % (cw * 2 + 1)).astype(np.uint32)
+            out = []
+            for lay in layers:
+                sepb = np.zeros((ch, cw * 2 + 1), dtype=np.uint8)
+                sepb[:, :cw * 2] = lay
+                out.append(sepb.reshape(-1)[flat])
+            return rel, lens, out
+
+        pool = []                     # opake UYVY-Bytes, alle Glyphen
+        bval, balf = [], []           # Saum: Wert- und Alpha-Bytes, parallel
+        pool_off = boff = 0
+        # pro Glyphe: (rel, src, lens, rel_b, src_b, lens_b) oder None
+        self.glyphs = []
         for idx in range(512):
             gx, gy = (idx // 256) * cw, (idx % 256) * ch
-            m = opaque[gy:gy + ch, gx:gx + cw]
-            if not m.any():
+            ga = aa[gy:gy + ch, gx:gx + cw]
+            if not (ga >= A_MIN).any():
                 self.glyphs.append(None)
                 continue
             gy_, gu, gv = (yy[gy:gy + ch, gx:gx + cw],
                            uu[gy:gy + ch, gx:gx + cw],
                            vv[gy:gy + ch, gx:gx + cw])
-            # UYVY-Zeile: pro Pixelpaar [U, Y0, V, Y1]; Chroma = Mittel des
-            # Paars. Byte-Maske: Y nur wenn SEIN Pixel opak, Chroma wenn
-            # irgendein Pixel des Paars opak ist.
+            # UYVY-Zeile: pro Pixelpaar [U, Y0, V, Y1]. Chroma = alpha-
+            # gewichtetes Mittel des Paars (ein transparenter Nachbar ist
+            # meist schwarz und wuerde die Farbe sonst verfaelschen);
+            # Chroma-Alpha = Mittel der Paar-Alphas.
+            a0, a1 = ga[:, 0::2], ga[:, 1::2]
+            asum = np.maximum(a0 + a1, 1)
+            u_pair = ((gu[:, 0::2] * a0 + gu[:, 1::2] * a1)
+                      // asum).astype(np.uint8)
+            v_pair = ((gv[:, 0::2] * a0 + gv[:, 1::2] * a1)
+                      // asum).astype(np.uint8)
+            a_pair = (a0 + a1) // 2
             row_bytes = np.zeros((ch, cw * 2), dtype=np.uint8)
-            row_mask = np.zeros((ch, cw * 2), dtype=bool)
-            a, bm = m[:, 0::2], m[:, 1::2]
-            u_pair = ((gu[:, 0::2] + gu[:, 1::2]) // 2).astype(np.uint8)
-            v_pair = ((gv[:, 0::2] + gv[:, 1::2]) // 2).astype(np.uint8)
+            row_alpha = np.zeros((ch, cw * 2), dtype=np.uint8)
             row_bytes[:, 0::4] = u_pair
             row_bytes[:, 1::4] = np.clip(gy_[:, 0::2], 16, 235)
             row_bytes[:, 2::4] = v_pair
             row_bytes[:, 3::4] = np.clip(gy_[:, 1::2], 16, 235)
-            row_mask[:, 0::4] = a | bm
-            row_mask[:, 1::4] = a
-            row_mask[:, 2::4] = a | bm
-            row_mask[:, 3::4] = bm
-            # Laeufe (zeilenweise zusammenhaengende opake Byte-Strecken).
-            # Trennspalte zwischen den Zeilen, sonst verschmilzt ein Lauf am
-            # Zeilenende mit dem Zeilenanfang darunter und der memcpy schmiert
-            # horizontal aus der Zelle (sichtbar als Linie bei Vollbreite-
-            # Glyphen wie Crosshair/Horizont).
-            sep_mask = np.zeros((ch, cw * 2 + 1), dtype=bool)
-            sep_mask[:, :cw * 2] = row_mask
-            sep_bytes = np.zeros((ch, cw * 2 + 1), dtype=np.uint8)
-            sep_bytes[:, :cw * 2] = row_bytes
-            flat = sep_mask.reshape(-1)
-            padded = np.concatenate(([False], flat, [False]))
-            d = np.diff(padded.astype(np.int8))
-            starts = np.flatnonzero(d == 1)
-            lens = (np.flatnonzero(d == -1) - starts).astype(np.uint32)
-            gbytes = sep_bytes.reshape(-1)[flat]
-            rows_of = starts // (cw * 2 + 1)
-            xs = starts % (cw * 2 + 1)
-            rel = (rows_of * (self.W * 2) + xs).astype(np.uint32)
-            src = (pool_off
-                   + np.concatenate(([0], np.cumsum(lens[:-1])))
-                   ).astype(np.uint32)
+            row_alpha[:, 0::4] = a_pair
+            row_alpha[:, 1::4] = a0
+            row_alpha[:, 2::4] = a_pair
+            row_alpha[:, 3::4] = a1
+            m_op = row_alpha >= A_OPAQUE
+            m_bl = (row_alpha >= A_MIN) & ~m_op
+            # Saumlaeufe sind einzeln nur wenige Bytes lang; jede uncached-
+            # Lesetransaktion kostet aber ~500 ns Latenz (gemessen: 8400
+            # Einzellaeufe = 4,8 ms/Frame). Darum Luecken <= 24 B zwischen
+            # Saumstuecken einer Zeile MIT aufnehmen: opake Kerne blenden
+            # zu ihrem eigenen Wert (No-Op), Hintergrund hat Alpha ~0
+            # (Identitaet) -- wenige lange Reads statt vieler kurzer.
+            m_bl = self._fill_gaps(m_bl, 24)
+
+            rel, lens, (gbytes,) = runs_from(m_op, row_bytes)
+            src = (pool_off + np.concatenate(([0], np.cumsum(lens)))
+                   )[:len(lens)].astype(np.uint32)
             pool.append(gbytes)
             pool_off += len(gbytes)
-            self.glyphs.append((rel, src, lens))
-        self.pool = np.ascontiguousarray(np.concatenate(pool))
+
+            rel_b, lens_b, (bb, ba) = runs_from(m_bl, row_bytes, row_alpha)
+            src_b = (boff + np.concatenate(([0], np.cumsum(lens_b)))
+                     )[:len(lens_b)].astype(np.uint32)
+            bval.append(bb)
+            balf.append(ba)
+            boff += len(bb)
+
+            self.glyphs.append((rel, src, lens, rel_b, src_b, lens_b))
+        z = np.zeros(0, dtype=np.uint8)
+        self.pool = np.ascontiguousarray(np.concatenate(pool or [z]))
+        self.bval = np.ascontiguousarray(np.concatenate(bval or [z]))
+        self.balf = np.ascontiguousarray(np.concatenate(balf or [z]))
         self.pool_ptr = self.pool.ctypes.data_as(self.ctypes.c_void_p)
+        self.bval_ptr = self.bval.ctypes.data_as(self.ctypes.c_void_p)
+        self.balf_ptr = self.balf.ctypes.data_as(self.ctypes.c_void_p)
         self.n_glyphs = sum(1 for g in self.glyphs if g is not None)
 
     # --- Grid-Paket -> flache Lauftabelle -------------------------------------
     def rebuild(self, rows, cols, grid):
+        # INAV zeichnet mit ~46 Hz, meist ohne inhaltliche Aenderung --
+        # identische Grids kosten dann nur diesen Vergleich.
+        key = (rows, cols, grid)
+        if key == self._last_grid:
+            return
+        self._last_grid = key
         np = self.np
         # Canvas zentrieren (auch SD-Grids landen mittig im Bild)
         x0 = (self.W - cols * self.cell_w) // 2 & ~1
@@ -644,9 +717,9 @@ class OsdEngine:
         if x0 < 0 or y0 < 0:
             # Grid passt nicht ins Bild -- lieber kein OSD als korrupte
             # Laeufe ausserhalb der Zeilen (zerrissenes Bild).
-            self.tables = None
+            self.tables = self.btables = None
             return
-        parts = []
+        parts, bparts = [], []
         for i, glyph_idx in enumerate(grid):
             if not glyph_idx:
                 continue
@@ -654,20 +727,25 @@ class OsdEngine:
             if g is None:
                 continue
             r, c = divmod(i, cols)
-            base = ((y0 + r * self.cell_h) * self.W * 2
-                    + (x0 + c * self.cell_w) * 2)
-            rel, src, lens = g
-            parts.append((rel + np.uint32(base), src, lens))
-        if not parts:
-            self.tables = None
-            return
-        dst = np.concatenate([p[0] for p in parts])
-        src = np.concatenate([p[1] for p in parts])
-        lens = np.concatenate([p[2] for p in parts])
-        runs = np.ascontiguousarray(
-            np.column_stack([dst, src, lens]).astype(np.uint32).reshape(-1))
-        self.tables = (runs.ctypes.data_as(self.ctypes.c_void_p),
-                       len(dst), runs)
+            base = np.uint32((y0 + r * self.cell_h) * self.W * 2
+                             + (x0 + c * self.cell_w) * 2)
+            rel, src, lens, rel_b, src_b, lens_b = g
+            if len(lens):
+                parts.append((rel + base, src, lens))
+            if len(lens_b):
+                bparts.append((rel_b + base, src_b, lens_b))
+
+        def flatten(plist):
+            if not plist:
+                return None
+            runs = np.ascontiguousarray(np.column_stack(
+                [np.concatenate([p[j] for p in plist]) for j in range(3)]
+            ).astype(np.uint32).reshape(-1))
+            return (runs.ctypes.data_as(self.ctypes.c_void_p),
+                    len(runs) // 3, runs)
+
+        self.tables = flatten(parts)
+        self.btables = flatten(bparts)
 
     def _start_listener(self):
         import socket
@@ -694,9 +772,24 @@ class OsdEngine:
         threading.Thread(target=run, daemon=True).start()
 
     def stamp(self, addr):
+        t0 = time.monotonic() if self._timing else 0.0
         t = self.tables
         if t:
             self.lib.stamp(addr, self.pool_ptr, t[0], t[1])
+        b = self.btables
+        if b:
+            self.lib.blend(addr, self.bval_ptr, self.balf_ptr, b[0], b[1])
+        if self._timing:
+            dt = time.monotonic() - t0
+            self._tsum += dt
+            self._tmax = max(self._tmax, dt)
+            self._tn += 1
+            if self._tn >= 600:
+                log(f'osd-timing: avg {self._tsum / self._tn * 1e3:.2f} ms, '
+                    f'max {self._tmax * 1e3:.2f} ms, '
+                    f'runs {t[1] if t else 0}+{b[1] if b else 0}')
+                self._tsum = self._tmax = 0.0
+                self._tn = 0
 
 
 def register_osd_element(engine):
