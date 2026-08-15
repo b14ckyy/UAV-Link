@@ -36,6 +36,7 @@ apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-bad gstreamer1.0-libav gstreamer1.0-rtsp \
     gir1.2-gst-rtsp-server-1.0 python3-gi v4l-utils \
     python3-flask python3-venv python3-gpiozero python3-lgpio \
+    python3-numpy python3-gst-1.0 gir1.2-gdkpixbuf-2.0 \
     modemmanager libqmi-utils network-manager nftables wireguard-tools socat \
     i2c-tools \
     || warn "some packages failed to install"
@@ -68,6 +69,16 @@ printf '{"channel":"%s","ref":"%s","commit":"%s","commit_date":"%s","updated":"%
     "$CH" "$REF" "$COMMIT" "$CDATE" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$UAV_DIR/VERSION"
 chown -R "$UAV_USER:$UAV_USER" "$UAV_DIR"
 chmod +x "$UAV_DIR/uav-wg-apply" "$UAV_DIR/uav-update" "$UAV_DIR/uav-backup" "$UAV_DIR/uav-hdmi-setup" "$UAV_DIR/uav-recorder" "$UAV_DIR/reset-credentials.sh" "$UAV_DIR"/test/*.sh 2>/dev/null
+
+# OSD-Stanzer kompilieren (winzige .so; gcc ist Teil des Basis-Images).
+# Idempotent: nur wenn die .so fehlt oder die Quelle neuer ist.
+if [ "$UAV_DIR/osd-stamp.c" -nt "$UAV_DIR/libosdstamp.so" ] 2>/dev/null \
+        || [ ! -f "$UAV_DIR/libosdstamp.so" ]; then
+    log "compiling OSD stamper..."
+    gcc -O3 -shared -fPIC -o "$UAV_DIR/libosdstamp.so" "$UAV_DIR/osd-stamp.c" \
+        && chown "$UAV_USER:$UAV_USER" "$UAV_DIR/libosdstamp.so" \
+        || warn "OSD stamper build failed (OSD burn-in will stay off)"
+fi
 
 # --- 3. OLED venv (luma.oled) --------------------------------------------------
 if [ ! -x "$UAV_DIR/oled-venv/bin/python" ]; then
@@ -168,14 +179,14 @@ log "enabling services..."
 systemctl enable --now \
     uav-wifi-on.service uav-wifi-fallback.service uav-hdmi.service \
     uav-rtsp.service uav-web.service uav-msp.service uav-oled.service \
-    uav-recorder.service \
+    uav-recorder.service uav-osd.service \
     >/dev/null 2>&1 || warn "some services failed to start (may need the reboot)"
 # `enable --now` no-ops on an already-running unit, so an update would deploy new
 # code but keep the old process. Restart the long-running services so updates take
 # effect immediately. Detached-safe: updates run under uav-update@.service, so
 # restarting uav-web does not kill the running updater. try-restart skips units
 # that aren't running (e.g. uav-oled without OLED hardware).
-for s in uav-rtsp uav-msp uav-oled uav-web uav-recorder; do
+for s in uav-rtsp uav-msp uav-oled uav-web uav-recorder uav-osd; do
     systemctl try-restart "$s.service" >/dev/null 2>&1 || warn "restart $s failed"
 done
 # Ein hinterlegter WireGuard-Tunnel muss einen Reboot ueberleben. Aeltere

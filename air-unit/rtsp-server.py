@@ -18,6 +18,7 @@ import json
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -410,6 +411,9 @@ def build_pipeline(cfg, src):
         caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
     source = f'v4l2src device={src["dev"]} ! {caps} '
     decode = '' if raw else '! jpegdec max-errors=-1 '
+    # OSD-Burn-in: nach videorate/Scale (weniger Frames zu stanzen), direkt
+    # vor dem Encoder. Nur wenn die Engine aktiv ist (Rohquelle, Font da).
+    osd = '! osdstamp ' if OSD_ENGINE else ''
     scale = ''
     if raw and fps < src['framerate']:
         scale += f'! videorate drop-only=true ! video/x-raw,framerate={fps}/1 '
@@ -451,6 +455,7 @@ def build_pipeline(cfg, src):
             f'{decode}'
             f'{scale}'
             f'{vrate}'
+            f'{osd}'
             f'! v4l2jpegenc '
             f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
         )
@@ -460,6 +465,7 @@ def build_pipeline(cfg, src):
         f'{decode}'
         f'{scale}'
         f'{vrate}'
+        f'{osd}'
         f'! v4l2h264enc extra-controls="controls,'
         f'video_bitrate={bitrate},{cbr}'
         f'h264_i_frame_period={fps},repeat_sequence_header=1" '
@@ -468,6 +474,246 @@ def build_pipeline(cfg, src):
         f'! rtph264pay name=pay0 pt=96 config-interval=1 '
         f'aggregate-mode=zero-latency mtu=1200 )'
     )
+
+
+# ============================== FPV-OSD (Burn-in) =============================
+# MSP-DisplayPort-OSD, eingebrannt vor dem Encoder. Arbeitsteilung:
+#   uav-osd.py   liest den DisplayPort-UART und schickt bei jedem "draw" das
+#                Zeichen-Grid als UDP-Paket an OSD_UDP_PORT (localhost).
+#   OsdEngine    laedt das Font-PNG (SneakyFPV-Format: 2 Spalten x 256 Zeilen
+#                Glyphen, beliebige Variante -- wird per GdkPixbuf auf die
+#                Zellgroesse der aktuellen Aufloesung skaliert), kompiliert
+#                pro Glyphe UYVY-Byte-Laeufe vor und baut bei jedem Grid-
+#                Update (~10 Hz) die flache Lauftabelle.
+#   osdstamp     (GstBase-Element) ruft pro Frame einmal libosdstamp.so:
+#                memcpy der Laeufe in den Framebuffer. Gemessen 15.08.:
+#                0,83 ms/Frame fuer ein 162-Zellen-OSD, 720p60 gehalten.
+# Kein Alpha-Mixing, kein Frame-LESEN (DMA-Puffer sind uncached, ~125 MB/s
+# lesend -- Read-Modify-Write ist auf dieser Plattform tot, s. STATUS 15.08.).
+# Vorerst nur Rohquellen (UYVY); der MJPEG-Pfad (I420 nach jpegdec) braucht
+# eigene planare Lauftabellen -- TODO, wenn Bedarf besteht.
+OSD_UDP_PORT = 5761
+FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'fonts', 'osd-font.png')
+OSD_ENGINE = None
+
+
+class OsdEngine:
+    """Font -> Glyphen-Laeufe -> Lauftabelle; UDP-Listener; Stanz-Element."""
+
+    @staticmethod
+    def create(cfg, src):
+        """Baut die Engine oder gibt None zurueck -- niemals den Stream reissen."""
+        osd = cfg.get('osd') or {}
+        if not (osd.get('enabled') and osd.get('mode', 'burnin') == 'burnin'):
+            return None
+        if src['kind'] != 'raw' or src.get('fmt') != 'UYVY':
+            log('OSD-Burn-in: nur fuer Rohquellen (UYVY) -- uebersprungen')
+            return None
+        if not os.path.exists(FONT_PATH):
+            log('OSD-Burn-in: kein Font hochgeladen -- uebersprungen')
+            return None
+        try:
+            eng = OsdEngine(cfg['width'], cfg['height'])
+        except Exception as e:            # noqa: BLE001 -- Stream schuetzen
+            log(f'OSD-Burn-in deaktiviert: {e}')
+            return None
+        log(f'OSD-Burn-in aktiv: Zelle {eng.cell_w}x{eng.cell_h}, '
+            f'{eng.n_glyphs} Glyphen')
+        return eng
+
+    def __init__(self, width, height):
+        import ctypes
+        import numpy as np
+        self.np = np
+        self.W, self.H = width, height
+        # Zellgroesse aus der Hoehe: 20 Zeilen fuellen das Bild exakt
+        # (720 -> 24x36, 1080 -> 36x54); Breite = 2/3 der Hoehe, auf
+        # gerade Werte gerundet (UYVY-Paar-Alignment).
+        self.cell_h = height // 20
+        self.cell_w = (self.cell_h * 2 // 3) & ~1
+        lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'libosdstamp.so')
+        self.lib = ctypes.CDLL(lib_path)
+        self.lib.stamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_void_p, ctypes.c_uint32]
+        self.ctypes = ctypes
+        self._load_font()
+        self.tables = None            # (runs_ptr, n_runs, runs_ref)
+        self._start_listener()
+
+    # --- Font: PNG -> pro Glyphe UYVY-Bytes + Lauf-Fragmente ------------------
+    def _load_font(self):
+        import gi
+        gi.require_version('GdkPixbuf', '2.0')
+        from gi.repository import GdkPixbuf
+        np = self.np
+        pb = GdkPixbuf.Pixbuf.new_from_file(FONT_PATH)
+        # Layout: 2 Glyphenspalten x 256 Zeilen. Variante egal -- skaliert wird
+        # auf die Zellgroesse der aktuellen Aufloesung (downscale >> upscale,
+        # also am besten die groesste Variante hochladen).
+        if pb.get_height() % 256 or pb.get_width() % 2:
+            raise ValueError(f'Font-PNG-Layout unbekannt '
+                             f'({pb.get_width()}x{pb.get_height()})')
+        if (pb.get_width() // 2, pb.get_height() // 256) != \
+                (self.cell_w, self.cell_h):
+            pb = pb.scale_simple(self.cell_w * 2, self.cell_h * 256,
+                                 GdkPixbuf.InterpType.HYPER)
+        if not pb.get_has_alpha():
+            raise ValueError('Font-PNG hat keinen Alphakanal')
+        w, h = pb.get_width(), pb.get_height()
+        stride = pb.get_rowstride()
+        raw = np.frombuffer(pb.get_pixels(), dtype=np.uint8)
+        img = np.zeros((h, w, 4), dtype=np.uint8)
+        for y in range(h):
+            img[y] = raw[y * stride:y * stride + w * 4].reshape(w, 4)
+        r = img[:, :, 0].astype(np.int32)
+        g = img[:, :, 1].astype(np.int32)
+        b = img[:, :, 2].astype(np.int32)
+        opaque = img[:, :, 3] >= 128
+        yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16
+        uu = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128
+        vv = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128
+        cw, ch = self.cell_w, self.cell_h
+        pool = []                     # globaler Byte-Pool ueber alle Glyphen
+        pool_off = 0
+        self.glyphs = []              # pro Glyphe: (rel_dst, src, laengen)
+        for idx in range(512):
+            gx, gy = (idx // 256) * cw, (idx % 256) * ch
+            m = opaque[gy:gy + ch, gx:gx + cw]
+            if not m.any():
+                self.glyphs.append(None)
+                continue
+            gy_, gu, gv = (yy[gy:gy + ch, gx:gx + cw],
+                           uu[gy:gy + ch, gx:gx + cw],
+                           vv[gy:gy + ch, gx:gx + cw])
+            # UYVY-Zeile: pro Pixelpaar [U, Y0, V, Y1]; Chroma = Mittel des
+            # Paars. Byte-Maske: Y nur wenn SEIN Pixel opak, Chroma wenn
+            # irgendein Pixel des Paars opak ist.
+            row_bytes = np.zeros((ch, cw * 2), dtype=np.uint8)
+            row_mask = np.zeros((ch, cw * 2), dtype=bool)
+            a, bm = m[:, 0::2], m[:, 1::2]
+            u_pair = ((gu[:, 0::2] + gu[:, 1::2]) // 2).astype(np.uint8)
+            v_pair = ((gv[:, 0::2] + gv[:, 1::2]) // 2).astype(np.uint8)
+            row_bytes[:, 0::4] = u_pair
+            row_bytes[:, 1::4] = np.clip(gy_[:, 0::2], 16, 235)
+            row_bytes[:, 2::4] = v_pair
+            row_bytes[:, 3::4] = np.clip(gy_[:, 1::2], 16, 235)
+            row_mask[:, 0::4] = a | bm
+            row_mask[:, 1::4] = a
+            row_mask[:, 2::4] = a | bm
+            row_mask[:, 3::4] = bm
+            # Laeufe (zeilenweise zusammenhaengende opake Byte-Strecken)
+            flat = row_mask.reshape(-1)
+            padded = np.concatenate(([False], flat, [False]))
+            d = np.diff(padded.astype(np.int8))
+            starts = np.flatnonzero(d == 1)
+            lens = (np.flatnonzero(d == -1) - starts).astype(np.uint32)
+            gbytes = row_bytes.reshape(-1)[flat]
+            rows_of = starts // (cw * 2)
+            xs = starts % (cw * 2)
+            rel = (rows_of * (self.W * 2) + xs).astype(np.uint32)
+            src = (pool_off
+                   + np.concatenate(([0], np.cumsum(lens[:-1])))
+                   ).astype(np.uint32)
+            pool.append(gbytes)
+            pool_off += len(gbytes)
+            self.glyphs.append((rel, src, lens))
+        self.pool = np.ascontiguousarray(np.concatenate(pool))
+        self.pool_ptr = self.pool.ctypes.data_as(self.ctypes.c_void_p)
+        self.n_glyphs = sum(1 for g in self.glyphs if g is not None)
+
+    # --- Grid-Paket -> flache Lauftabelle -------------------------------------
+    def rebuild(self, rows, cols, grid):
+        np = self.np
+        # Canvas zentrieren (auch SD-Grids landen mittig im Bild)
+        x0 = (self.W - cols * self.cell_w) // 2 & ~1
+        y0 = (self.H - rows * self.cell_h) // 2
+        parts = []
+        for i, glyph_idx in enumerate(grid):
+            if not glyph_idx:
+                continue
+            g = self.glyphs[glyph_idx] if glyph_idx < 512 else None
+            if g is None:
+                continue
+            r, c = divmod(i, cols)
+            base = ((y0 + r * self.cell_h) * self.W * 2
+                    + (x0 + c * self.cell_w) * 2)
+            rel, src, lens = g
+            parts.append((rel + np.uint32(base), src, lens))
+        if not parts:
+            self.tables = None
+            return
+        dst = np.concatenate([p[0] for p in parts])
+        src = np.concatenate([p[1] for p in parts])
+        lens = np.concatenate([p[2] for p in parts])
+        runs = np.ascontiguousarray(
+            np.column_stack([dst, src, lens]).astype(np.uint32).reshape(-1))
+        self.tables = (runs.ctypes.data_as(self.ctypes.c_void_p),
+                       len(dst), runs)
+
+    def _start_listener(self):
+        import socket
+        import threading
+
+        def run():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(('127.0.0.1', OSD_UDP_PORT))
+            while True:
+                try:
+                    data, _ = sock.recvfrom(65535)
+                    if len(data) < 8 or data[:4] != b'UOSD':
+                        continue
+                    rows, cols = data[5], data[6]
+                    n = rows * cols
+                    if len(data) < 8 + 2 * n:
+                        continue
+                    grid = struct.unpack_from(f'<{n}H', data, 8)
+                    self.rebuild(rows, cols, grid)
+                except Exception as e:   # noqa: BLE001 -- Stream schuetzen
+                    log(f'OSD-Listener: {e}')
+                    time.sleep(1)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def stamp(self, addr):
+        t = self.tables
+        if t:
+            self.lib.stamp(addr, self.pool_ptr, t[0], t[1])
+
+
+def register_osd_element(engine):
+    """osdstamp-Element registrieren (einmalig, vor dem Pipeline-Parse)."""
+    import gi
+    gi.require_version('GstBase', '1.0')
+    from gi.repository import GstBase, GObject
+
+    caps = Gst.Caps.from_string('video/x-raw,format=UYVY')
+
+    class OsdStamp(GstBase.BaseTransform):
+        __gstmetadata__ = ('osdstamp', 'Filter/Video',
+                           'UAV-Link OSD burn-in (masked memcpy)', 'uav-link')
+        __gsttemplates__ = (
+            Gst.PadTemplate.new('sink', Gst.PadDirection.SINK,
+                                Gst.PadPresence.ALWAYS, caps),
+            Gst.PadTemplate.new('src', Gst.PadDirection.SRC,
+                                Gst.PadPresence.ALWAYS, caps),
+        )
+
+        def do_transform_ip(self, buf):
+            try:
+                ok, m = buf.map(Gst.MapFlags.READ | Gst.MapFlags.WRITE)
+                if ok:
+                    cbuf = (engine.ctypes.c_ubyte * m.size).from_buffer(m.data)
+                    engine.stamp(engine.ctypes.addressof(cbuf))
+                    buf.unmap(m)
+            except Exception as e:       # noqa: BLE001 -- Stream schuetzen
+                log(f'osdstamp: {e}')
+            return Gst.FlowReturn.OK
+
+    GObject.type_register(OsdStamp)
+    if not Gst.Element.register(None, 'osdstamp', Gst.Rank.NONE, OsdStamp):
+        raise RuntimeError('osdstamp-Registrierung fehlgeschlagen')
 
 
 def on_media_configure(factory, media, cfg):
@@ -559,6 +805,14 @@ def main():
         threading.Thread(target=watch_signal, args=(src,), daemon=True).start()
 
     Gst.init(None)
+    global OSD_ENGINE
+    OSD_ENGINE = OsdEngine.create(cfg, src)
+    if OSD_ENGINE:
+        try:
+            register_osd_element(OSD_ENGINE)
+        except Exception as e:           # noqa: BLE001 -- Stream schuetzen
+            log(f'OSD-Element-Registrierung fehlgeschlagen: {e}')
+            OSD_ENGINE = None
     server = GstRtspServer.RTSPServer()
     server.set_service(str(cfg['port']))
     factory = GstRtspServer.RTSPMediaFactory()

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import subprocess
 import tempfile
 import threading
@@ -472,6 +473,32 @@ def recorder_status():
         return None
 
 
+OSD_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             'fonts', 'osd-font.png')
+
+
+def osd_status():
+    """Zustand des OSD-Readers aus /run/uav-osd.status (JSON)."""
+    try:
+        with open('/run/uav-osd.status') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def osd_font_info():
+    """Abmessungen des hochgeladenen Fonts (PNG-IHDR, ohne Bildbibliothek)."""
+    try:
+        with open(OSD_FONT_PATH, 'rb') as f:
+            head = f.read(24)
+        if head[:8] != b'\x89PNG\r\n\x1a\n' or head[12:16] != b'IHDR':
+            return None
+        w, h = struct.unpack('>II', head[16:24])
+        return {'w': w, 'h': h, 'glyph': f'{w // 2}×{h // 256}'}
+    except (OSError, struct.error):
+        return None
+
+
 def usb_backup_target():
     """First USB block device (never the SD) + its first filesystem partition.
     Detection only -- lsblk needs no root."""
@@ -670,6 +697,57 @@ TEMPLATE = """<!doctype html>
   </div>
   <button type="submit">Save &amp; restart pipeline</button>
 </form></div>
+
+<h2>FPV OSD</h2>
+<div class="card">
+<form method="post" action="/osd_save">
+  <div class="row">
+    <div><label>&nbsp;</label>
+      <label style="display:flex;align-items:center;gap:.5em;margin:0">
+        <input type="checkbox" name="osd_enabled" value="1"
+               style="width:auto" {{ 'checked' if osd.enabled }}>
+        MSP-DisplayPort OSD</label></div>
+    <div><label>Mode</label>
+      <select name="osd_mode">
+        <option value="burnin" {{ 'selected' if osd.get('mode', 'burnin') == 'burnin' }}>
+          Burn into video (air unit)</option>
+        <option value="downlink" {{ 'selected' if osd.get('mode') == 'downlink' }}>
+          Downlink to GCS (needs future KiteGC)</option>
+      </select></div>
+  </div>
+  <div class="hint">
+    {% if osd_status and osd_status.state == 'active' %}
+      FC feeding OSD: grid {{ osd_status.grid }}, {{ osd_status.draw_hz }} draws/s.
+    {% elif osd_status and osd_status.state == 'waiting' %}
+      UART open, waiting for DisplayPort data — enable MSP DisplayPort on the FC.
+    {% elif osd_status and osd_status.state == 'no-uart' %}
+      UART {{ osd_status.uart }} not available.
+    {% elif osd.enabled %}
+      OSD service starting…
+    {% endif %}
+    Dedicated DisplayPort UART (fixed): /dev/serial0 @ 115200 — wire it to a
+    spare FC UART with OSD type set to HD/MSP DisplayPort. Burn-in currently
+    supports the HDMI/CSI (raw) source.
+  </div>
+  <button type="submit">Save &amp; restart OSD</button>
+</form>
+<form method="post" action="/osd_font" enctype="multipart/form-data">
+  <div class="row">
+    <div><label>OSD font (SneakyFPV PNG, any resolution variant)</label>
+      <input type="file" name="font" accept=".png"></div>
+    <div><label>&nbsp;</label><button type="submit">Upload font</button></div>
+  </div>
+  <div class="hint">
+    {% if osd_font %}
+      Current font: {{ osd_font.w }}×{{ osd_font.h }} px
+      ({{ osd_font.glyph }} per glyph) — auto-scaled to the video resolution.
+    {% else %}
+      No font uploaded yet — burn-in stays off until one is provided.
+      Upload the largest variant you have; it is scaled down as needed.
+    {% endif %}
+  </div>
+</form>
+</div>
 
 <h2>Network</h2>
 <div class="card">
@@ -1327,6 +1405,8 @@ def index():
         usb=usb_backup_target(),
         rec=(cfg.get('record') or {}), rec_targets=usb_record_targets(),
         rec_status=recorder_status(),
+        osd=(cfg.get('osd') or {}), osd_status=osd_status(),
+        osd_font=osd_font_info(),
         default_pw=is_default_password(),
         ap_pw_warn=(wifi_status()[0] and hotspot_pw_default()),
         wifi_on=sh(['nmcli', 'radio', 'wifi']) == 'enabled',
@@ -1450,6 +1530,50 @@ def save():
     # nach dem Pipeline-Neustart ein frisches Segment. Deaktiviert -> das
     # Skript beendet sich sofort mit Exit 0 (Dienst inaktiv).
     sh(['sudo', 'systemctl', 'restart', 'uav-recorder.service'], timeout=20)
+    return redirect('/')
+
+
+@app.route('/osd_save', methods=['POST'])
+def osd_save():
+    cfg = load_config()
+    osd = cfg.get('osd') or {}
+    osd['enabled'] = bool(request.form.get('osd_enabled'))
+    mode = request.form.get('osd_mode', 'burnin')
+    osd['mode'] = mode if mode in ('burnin', 'downlink') else 'burnin'
+    # UART/Baud bewusst nicht im UI: haengt fest am FC (115200 traegt
+    # HD-DisplayPort); Aenderung nur direkt in der config.json.
+    osd.setdefault('uart', '/dev/serial0')
+    osd.setdefault('baud', 115200)
+    cfg['osd'] = osd
+    save_config(cfg)
+    sh(['sudo', 'systemctl', 'restart', 'uav-osd.service'], timeout=20)
+    # Pipeline neu bauen: Burn-in-Element kommt/geht mit der Option
+    sh(['sudo', 'systemctl', 'restart', 'uav-rtsp.service'], timeout=30)
+    return redirect('/')
+
+
+@app.route('/osd_font', methods=['POST'])
+def osd_font():
+    f = request.files.get('font')
+    if f is None or not f.filename:
+        return redirect('/')
+    data = f.read(9 * 1024 * 1024)
+    # Validierung: PNG-Magic + SneakyFPV-Layout (2 Glyphenspalten x 256
+    # Zeilen -> Breite gerade, Hoehe durch 256 teilbar), Groesse begrenzt.
+    if (len(data) > 8 * 1024 * 1024 or len(data) < 24
+            or data[:8] != b'\x89PNG\r\n\x1a\n' or data[12:16] != b'IHDR'):
+        return ('not a PNG font file', 400)
+    w, h = struct.unpack('>II', data[16:24])
+    if w % 2 or h % 256 or not (16 <= w // 2 <= 128) or h // 256 < 24:
+        return (f'unexpected font layout {w}x{h} '
+                f'(expected 2 glyph columns x 256 rows)', 400)
+    os.makedirs(os.path.dirname(OSD_FONT_PATH), exist_ok=True)
+    tmp = OSD_FONT_PATH + '.tmp'
+    with open(tmp, 'wb') as out:
+        out.write(data)
+    os.replace(tmp, OSD_FONT_PATH)
+    # Font neu laden = Pipeline-Neustart (Engine kompiliert beim Start)
+    sh(['sudo', 'systemctl', 'restart', 'uav-rtsp.service'], timeout=30)
     return redirect('/')
 
 

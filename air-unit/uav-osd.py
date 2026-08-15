@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""UAV-Link MSP-DisplayPort-Reader (FPV-OSD).
+
+Liest MSP-DisplayPort ("MSP OSD") von einem EIGENEN UART -- getrennt vom
+Haupt-MSP-Link der Bridge, wie am FC verkabelt. Der FC ist Master und
+schickt Zeichen-Kommandos (clear / write string / draw); dieser Dienst
+haelt daraus das Zeichen-Grid (HD-Canvas 53x20, SD 30x16) und schiebt es
+bei jedem "draw" als UDP-Paket an localhost -- dort rendert der
+rtsp-server das Burn-in (osdstamp) und/oder reicht es zur GCS weiter.
+
+Grid-Paket (UDP an 127.0.0.1:OSD_UDP_PORT, nur bei "draw"):
+  b'UOSD' | version u8 | rows u8 | cols u8 | 0 u8 | rows*cols * u16le
+  u16 = Glyphenindex (Zeichen + Fontpage*256), 0 = leere Zelle.
+
+Konfiguration (config.json, per Web-UI):
+  "osd": { "enabled": bool, "mode": "burnin"|"downlink",
+           "uart": "/dev/serial0", "baud": 115200 }
+Baud ist bewusst NICHT im UI: der Port haengt fest am FC; 115200 traegt
+HD-DisplayPort in der Praxis. Wie beim Recorder gilt: enabled=false ->
+Exit 0, das Web-UI togglet per systemctl restart.
+
+Status nach /run/uav-osd.status (JSON) fuers Web-UI.
+"""
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import time
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(DIR, 'config.json')
+STATUS_PATH = '/run/uav-osd.status'
+OSD_UDP_PORT = 5761
+
+# MSP-DisplayPort-Subkommandos (Betaflight/INAV displayport_msp)
+DP_HEARTBEAT = 0
+DP_RELEASE = 1
+DP_CLEAR = 2
+DP_WRITE = 3
+DP_DRAW = 4
+DP_OPTIONS = 5
+MSP_DISPLAYPORT = 182
+
+GRIDS = {0: (16, 30), 1: (18, 50), 2: (20, 53), 3: (20, 53)}
+DEFAULT_GRID = (20, 53)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def write_status(obj):
+    try:
+        with open(STATUS_PATH, 'w') as f:
+            json.dump(obj, f)
+        os.chmod(STATUS_PATH, 0o644)
+    except OSError:
+        pass
+
+
+# --- MSP-Parser (Kopie aus msp-bridge.py; bewusst dupliziert: eigener ---------
+# Prozess, und der Bindestrich im Dateinamen verhindert einen sauberen Import)
+def crc8_dvb_s2(data):
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0xD5) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+class MspParser:
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data):
+        self.buf += data
+        return self.extract()
+
+    def _resync(self):
+        del self.buf[:1]
+
+    def extract(self):
+        items, buf = [], self.buf
+        while buf:
+            i = buf.find(b'$')
+            if i < 0:
+                buf.clear()
+                break
+            if i > 0:
+                del buf[:i]
+            if len(buf) < 3:
+                break
+            if buf[2] not in b'<>!':
+                self._resync()
+                continue
+            if buf[1] == ord('X'):                      # MSPv2
+                if len(buf) < 8:
+                    break
+                func, size = struct.unpack_from('<HH', buf, 4)
+                if size > 8192:
+                    self._resync()
+                    continue
+                total = 8 + size + 1
+                if len(buf) < total:
+                    break
+                frame = bytes(buf[:total])
+                if crc8_dvb_s2(frame[3:-1]) == frame[-1]:
+                    items.append((func, frame[8:-1]))
+                    del buf[:total]
+                else:
+                    self._resync()
+            elif buf[1] == ord('M'):                    # MSPv1 (+ Jumbo)
+                if len(buf) < 5:
+                    break
+                size, cmd, hdr = buf[3], buf[4], 5
+                if size == 255:
+                    if len(buf) < 7:
+                        break
+                    size, hdr = struct.unpack_from('<H', buf, 5)[0], 7
+                if size > 8192:
+                    self._resync()
+                    continue
+                total = hdr + size + 1
+                if len(buf) < total:
+                    break
+                frame = bytes(buf[:total])
+                csum = 0
+                for b in frame[3:-1]:
+                    csum ^= b
+                if csum == frame[-1]:
+                    items.append((cmd, frame[hdr:-1]))
+                    del buf[:total]
+                else:
+                    self._resync()
+            else:
+                self._resync()
+        return items
+
+
+# --- Serial (termios, Stil wie msp-bridge) ------------------------------------
+def open_serial(dev, baud):
+    import termios
+    import tty
+    fd = os.open(dev, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    tty.setraw(fd)
+    attrs = termios.tcgetattr(fd)
+    speed = getattr(termios, f'B{baud}', termios.B115200)
+    attrs[4] = attrs[5] = speed
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    return fd
+
+
+class OsdState:
+    def __init__(self):
+        self.rows, self.cols = DEFAULT_GRID
+        self.grid = [0] * (self.rows * self.cols)
+        self.draws = 0
+        self.last_draw = 0.0
+        self.last_frame = 0.0
+
+    def set_grid(self, rows, cols):
+        if (rows, cols) != (self.rows, self.cols):
+            log(f'Grid: {cols}x{rows}')
+            self.rows, self.cols = rows, cols
+            self.grid = [0] * (rows * cols)
+
+    def clear(self):
+        self.grid = [0] * (self.rows * self.cols)
+
+    def write(self, row, col, attr, chars):
+        # Fontpage in den Attr-Bits (Bit 0/1); wir tragen 2 Seiten = 512 Glyphen
+        page = attr & 0x01
+        if row >= self.rows:
+            return
+        base = row * self.cols
+        for i, ch in enumerate(chars):
+            c = col + i
+            if c >= self.cols:
+                break
+            self.grid[base + c] = ch + 256 * page
+
+    def packet(self):
+        return (b'UOSD' + bytes([1, self.rows, self.cols, 0])
+                + struct.pack(f'<{len(self.grid)}H', *self.grid))
+
+
+def main():
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    osd = cfg.get('osd') or {}
+    if not osd.get('enabled'):
+        write_status({'state': 'disabled'})
+        log('OSD deaktiviert -- Ende')
+        return 0
+    dev = osd.get('uart', '/dev/serial0')
+    baud = int(osd.get('baud', 115200))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    state = OsdState()
+    parser = MspParser()
+    fd = None
+    last_status = 0.0
+    draws_window = []
+
+    log(f'MSP-DisplayPort-Reader: {dev} @ {baud}')
+    while True:
+        if fd is None:
+            try:
+                fd = open_serial(dev, baud)
+                log(f'UART offen: {dev}')
+            except OSError as e:
+                write_status({'state': 'no-uart', 'uart': dev,
+                              'error': str(e)})
+                time.sleep(3)
+                continue
+        r, _, _ = select.select([fd], [], [], 1.0)
+        now = time.monotonic()
+        if r:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                data = b''
+            if not data:
+                os.close(fd)
+                fd = None
+                log('UART weg -- neu verbinden')
+                continue
+            state.last_frame = now
+            for func, payload in parser.feed(data):
+                if func != MSP_DISPLAYPORT or not payload:
+                    continue
+                sub = payload[0]
+                if sub == DP_CLEAR:
+                    state.clear()
+                elif sub == DP_WRITE and len(payload) >= 4:
+                    state.write(payload[1], payload[2], payload[3],
+                                payload[4:])
+                elif sub == DP_DRAW:
+                    state.draws += 1
+                    state.last_draw = now
+                    draws_window.append(now)
+                    sock.sendto(state.packet(),
+                                ('127.0.0.1', OSD_UDP_PORT))
+                elif sub == DP_OPTIONS and len(payload) >= 3:
+                    state.set_grid(*GRIDS.get(payload[2], DEFAULT_GRID))
+        if now - last_status >= 2.0:
+            last_status = now
+            draws_window = [t for t in draws_window if now - t < 5.0]
+            write_status({
+                'state': ('active' if now - state.last_draw < 3.0 else
+                          'waiting'),
+                'uart': dev,
+                'grid': f'{state.cols}x{state.rows}',
+                'draw_hz': round(len(draws_window) / 5.0, 1),
+                'mode': osd.get('mode', 'burnin'),
+            })
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

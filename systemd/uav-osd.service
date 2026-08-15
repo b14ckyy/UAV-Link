@@ -1,0 +1,14 @@
+[Unit]
+Description=UAV-Link MSP-DisplayPort OSD reader
+After=local-fs.target
+
+[Service]
+User=__UAVLINK_USER__
+ExecStart=/usr/bin/python3 __UAVLINK_DIR__/uav-osd.py
+# Beendet sich mit Exit 0, wenn osd.enabled aus ist -- das Web-UI togglet
+# per systemctl restart (Config schreiben, restart, fertig).
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

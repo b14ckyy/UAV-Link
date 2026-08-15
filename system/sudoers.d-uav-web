@@ -8,3 +8,4 @@ __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-oled.servic
 __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block uav-update@*
 __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block uav-backup.service
 __UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-recorder.service
+__UAVLINK_USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl restart uav-osd.service
