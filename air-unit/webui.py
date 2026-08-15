@@ -1462,31 +1462,39 @@ def api_stats():
 
 @app.route('/preview.jpg')
 def preview():
+    """Schnappschuss aus den vom rtsp-server gepflegten Cache-Dateien.
+
+    FRUEHER verband sich hier pro Poll ein kompletter RTSP-Kurzclient --
+    dessen Join/Teardown fuhr die geteilte Media durch PAUSED und stoppte
+    damit die KAMERA (bei UVC-Webcams 5-20 s Aussetzer, s. StreamHub im
+    rtsp-server). Jetzt haelt die persistente Capture-Pipeline das
+    juengste Keyframe (h264) bzw. JPEG in /tmp aktuell; hier wird nur
+    noch eine DATEI dekodiert -- null Rueckwirkung auf den Stream.
+    """
     global preview_ts
-    cfg = load_config()
+    kf = '/tmp/uav-keyframe.h264'
+    src_jpg = '/tmp/uav-preview-src.jpg'
     with preview_lock:
         if time.time() - preview_ts > 2.0:
             try:
                 os.unlink(PREVIEW_PATH)
             except OSError:
                 pass
-            url = f"rtsp://127.0.0.1:{cfg['port']}{cfg['mount']}"
-            # Mid-GOP-Falle: laeuft die geteilte Pipeline schon (ein anderer
-            # Client schaut), steigt der Snapshot mitten in die GOP ein --
-            # avdec rekonstruiert dann ohne Referenzbild und liefert graue
-            # Frames, und snapshot=true nimmt genau den ersten davon. Deshalb
-            # wartet der Depayloader aufs naechste Keyframe (kommt jede
-            # Sekunde, h264_i_frame_period=fps) und korrupte Frames werden
-            # verworfen. Startet die Preview die Pipeline selbst, ist Frame 1
-            # ohnehin ein IDR -- dann aendern beide Optionen nichts.
-            subprocess.run(
-                ['gst-launch-1.0', '-q', 'rtspsrc', f'location={url}',
-                 'latency=0', 'protocols=udp', '!',
-                 'rtph264depay', 'wait-for-keyframe=true', '!',
-                 'h264parse', '!', 'avdec_h264', 'output-corrupt=false', '!',
-                 'videoconvert', '!', 'jpegenc', 'snapshot=true', '!',
-                 'filesink', f'location={PREVIEW_PATH}'],
-                capture_output=True, timeout=10, check=False)
+            if (os.path.exists(src_jpg)
+                    and time.time() - os.path.getmtime(src_jpg) < 10):
+                with open(src_jpg, 'rb') as f:
+                    data = f.read()
+                with open(PREVIEW_PATH, 'wb') as f:
+                    f.write(data)
+            elif (os.path.exists(kf)
+                    and time.time() - os.path.getmtime(kf) < 10):
+                subprocess.run(
+                    ['gst-launch-1.0', '-q',
+                     'filesrc', f'location={kf}', '!',
+                     'h264parse', '!', 'avdec_h264', '!',
+                     'videoconvert', '!', 'jpegenc', 'snapshot=true', '!',
+                     'filesink', f'location={PREVIEW_PATH}'],
+                    capture_output=True, timeout=10, check=False)
             preview_ts = time.time()
     if os.path.exists(PREVIEW_PATH) and os.path.getsize(PREVIEW_PATH) > 0:
         resp = send_file(PREVIEW_PATH, mimetype='image/jpeg')

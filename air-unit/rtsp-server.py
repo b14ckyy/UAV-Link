@@ -383,7 +383,14 @@ def adopt_geometry(cfg, src):
         cfg['framerate'] = have[2]
 
 
-def build_pipeline(cfg, src):
+def build_pipelines(cfg, src):
+    """(Capture-Launch, Media-Launch, is_h264) -- getrennte Pipelines.
+
+    Capture (Quelle -> Encoder -> appsink) laeuft PERSISTENT im Prozess;
+    die RTSP-Media bekommt fertige Frames per appsrc. Hintergrund s.
+    StreamHub-Docstring: Client-Joins/-Teardowns fahren die geteilte
+    Media durch PAUSED und wuerden sonst die Kamera stoppen.
+    """
     raw = src['kind'] == 'raw'
     # Geometrie kommt aus der Config -- bei einer Rohquelle hat adopt_geometry()
     # sie vorher auf das gesetzt, was das Signal tatsaechlich liefert.
@@ -447,40 +454,55 @@ def build_pipeline(cfg, src):
     # Geht ausserdem nur, wo dekodiert wird -- im MJPEG-Passthrough gibt es kein Rohbild.
     vrate = ('! videorate ! video/x-raw,framerate=%d/1 ' % fps
              if cfg.get('smooth_pts', False) else '')
+    sink = ('! appsink name=vidsink emit-signals=true sync=false '
+            'max-buffers=4 drop=true')
+    jpeg_caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
+    asrc = ('appsrc name=vidsrc is-live=true format=time do-timestamp=true '
+            'max-buffers=60 leaky-type=downstream ')
     if codec == 'mjpeg-src':
         # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
         # und 0 % CPU, dafuer hohe Bitrate (~35 Mbit bei 720p60). Fuer LAN/WLAN gedacht.
         # Nur an einer MJPEG-Quelle moeglich (oben abgefangen und umgeschaltet).
         return (
-            f'( {source}'
-            f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
+            f'{source}{sink}',
+            f'( {asrc}caps="{jpeg_caps}" ! rtpjpegpay name=pay0 pt=26 mtu=1200 )',
+            False,
         )
     if codec == 'mjpeg':
         # HW-JPEG-Encode. Haelt die Bitrate bei ~10,5 Mbit (Rate-Control, s. o.).
         # Achtung: bei 720p60 reicht das Budget nur fuer 0,19 bit/px -> Artefakte.
         return (
-            f'( {source}'
+            f'{source}{decode}{scale}{vrate}{osd}! v4l2jpegenc {sink}',
+            f'( {asrc}caps="{jpeg_caps}" ! rtpjpegpay name=pay0 pt=26 mtu=1200 )',
+            False,
+        )
+    cbr = 'video_bitrate_mode=1,' if cfg.get('bitrate_mode') == 'cbr' else ''
+    # h264parse config-interval=-1 + byte-stream: SPS/PPS inline vor JEDEM
+    # IDR -- so ist jedes gecachte Keyframe (Preview!) und jeder Media-
+    # Einstieg selbsttragend dekodierbar.
+    h264_caps = 'video/x-h264,stream-format=byte-stream,alignment=au'
+    return (
+        (
+            f'{source}'
             f'{decode}'
             f'{scale}'
             f'{vrate}'
             f'{osd}'
-            f'! v4l2jpegenc '
-            f'! rtpjpegpay name=pay0 pt=26 mtu=1200 )'
-        )
-    cbr = 'video_bitrate_mode=1,' if cfg.get('bitrate_mode') == 'cbr' else ''
-    return (
-        f'( {source}'
-        f'{decode}'
-        f'{scale}'
-        f'{vrate}'
-        f'{osd}'
-        f'! v4l2h264enc extra-controls="controls,'
-        f'video_bitrate={bitrate},{cbr}'
-        f'h264_i_frame_period={fps},repeat_sequence_header=1" '
-        f'! video/x-h264,level=(string)4 '
-        f'! h264parse '
-        f'! rtph264pay name=pay0 pt=96 config-interval=1 '
-        f'aggregate-mode=zero-latency mtu=1200 )'
+            f'! v4l2h264enc extra-controls="controls,'
+            f'video_bitrate={bitrate},{cbr}'
+            f'h264_i_frame_period={fps},repeat_sequence_header=1" '
+            f'! video/x-h264,level=(string)4 '
+            f'! h264parse config-interval=-1 '
+            f'! {h264_caps} '
+            f'{sink}'
+        ),
+        (
+            f'( {asrc}caps="{h264_caps}" '
+            f'! h264parse '
+            f'! rtph264pay name=pay0 pt=96 config-interval=1 '
+            f'aggregate-mode=zero-latency mtu=1200 )'
+        ),
+        True,
     )
 
 
@@ -830,6 +852,102 @@ def register_osd_element(engine):
         raise RuntimeError('osdstamp-Registrierung fehlgeschlagen')
 
 
+# Fuers Web-UI gepflegte Schnappschuss-Dateien (Preview OHNE RTSP-Client)
+KEYFRAME_PATH = '/tmp/uav-keyframe.h264'
+PREVIEW_SRC_PATH = '/tmp/uav-preview-src.jpg'
+
+
+class StreamHub:
+    """Persistente Capture-Pipeline -> Frames an die RTSP-Media(s) verteilen.
+
+    Warum (gemessen 15.08., GST_DEBUG rtspmedia:5): gst-rtsp-server faehrt
+    die GETEILTE Media bei jedem Client-SETUP/PLAY UND jedem TEARDOWN durch
+    PAUSED -- fuer v4l2src heisst das STREAMOFF. Die CSI-Bridge verkraftet
+    das unsichtbar schnell, eine UVC-Webcam braucht danach 5-20 s (USB-
+    Renegotiation + Autoexposure-Konvergenz). Client-Wechsel (insbesondere
+    Kite-Auto-Reconnects, die Session-Leichen ohne TEARDOWN hinterlassen)
+    wuergten die Kamera so in einer selbsterhaltenden Freeze-Schleife ab.
+
+    Deshalb laufen Quelle und Encoder HIER, dauerhaft und clientunabhaengig;
+    die Media bekommt fertige Frames per appsrc. Ihre PAUSED-Zyklen treffen
+    nur noch appsrc -- die Kamera merkt von Clients nichts mehr. Nebenbei:
+    das juengste Keyframe (h264) bzw. JPEG liegt immer aktuell in /tmp,
+    die Web-UI-Preview braucht damit ebenfalls keinen RTSP-Client mehr.
+    """
+
+    def __init__(self, launch, is_h264):
+        self.lock = threading.Lock()
+        self.srcs = {}                 # appsrc -> darf schon Frames sehen
+        self.is_h264 = is_h264
+        self._last_save = 0.0
+        self.pipe = Gst.parse_launch(launch)
+        sink = self.pipe.get_by_name('vidsink')
+        sink.connect('new-sample', self._on_sample)
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self._on_error)
+        self.pipe.set_state(Gst.State.PLAYING)
+
+    def _on_error(self, bus, msg):
+        err, _ = msg.parse_error()
+        log(f'CAPTURE-FEHLER: {err.message} -- Neustart via systemd')
+        os.kill(os.getpid(), signal.SIGINT)
+
+    def attach(self, media):
+        s = media.get_element().get_by_name('vidsrc')
+        if s is None:
+            return
+        # h264: erst ab dem naechsten Keyframe fuettern (sauberer Einstieg,
+        # SPS/PPS haengen dank config-interval=-1 direkt davor). JPEG:
+        # jedes Frame steht fuer sich.
+        with self.lock:
+            self.srcs[s] = not self.is_h264
+        media.connect('unprepared', self._detach, s)
+
+    def _detach(self, media, s):
+        with self.lock:
+            self.srcs.pop(s, None)
+
+    def _on_sample(self, sink):
+        sample = sink.emit('pull-sample')
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        ok, m = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        data = bytes(m.data)
+        buf.unmap(m)
+        if key or not self.is_h264:
+            self._save_snapshot(data)
+        with self.lock:
+            if self.is_h264 and key:
+                for s in self.srcs:
+                    self.srcs[s] = True
+            targets = [s for s, ready in self.srcs.items() if ready]
+        for s in targets:
+            # Frische Buffer OHNE Timestamps pushen -- appsrc (do-timestamp)
+            # stempelt sie mit der Running-Time der jeweiligen Media.
+            # (Capture-PTS direkt durchreichen scheitert an der fremden
+            # Base-Time; PTS nullen scheitert an PyGIs Writability-Sperre.)
+            s.emit('push-buffer', Gst.Buffer.new_wrapped(data))
+        return Gst.FlowReturn.OK
+
+    def _save_snapshot(self, data):
+        now = time.monotonic()
+        if now - self._last_save < 1.0:
+            return
+        self._last_save = now
+        path = KEYFRAME_PATH if self.is_h264 else PREVIEW_SRC_PATH
+        try:
+            with open(path + '.tmp', 'wb') as f:
+                f.write(data)
+            os.replace(path + '.tmp', path)
+        except OSError:
+            pass
+
+
 def on_media_configure(factory, media, cfg):
     """FPS-Watchdog -- STANDARDMAESSIG AUS (config: "fps_watchdog": true).
 
@@ -927,14 +1045,27 @@ def main():
         except Exception as e:           # noqa: BLE001 -- Stream schuetzen
             log(f'OSD-Element-Registrierung fehlgeschlagen: {e}')
             OSD_ENGINE = None
+    capture, media_launch, is_h264 = build_pipelines(cfg, src)
+    hub = StreamHub(capture, is_h264)
+    log('Capture-Pipeline laeuft persistent -- Client-Wechsel beruehren '
+        'die Quelle nicht mehr (s. StreamHub)')
     server = GstRtspServer.RTSPServer()
     server.set_service(str(cfg['port']))
     factory = GstRtspServer.RTSPMediaFactory()
-    factory.set_launch(build_pipeline(cfg, src))
-    factory.set_shared(True)   # Quelle nur einmal oeffenbar -> Clients teilen Pipeline
+    factory.set_launch(media_launch)
+    # NICHT geteilt: jeder Client bekommt seine private Mini-Media (appsrc ->
+    # parse -> pay, ohne Encoder = praktisch gratis), der StreamHub fuettert
+    # alle parallel. Der alte Grund fuer set_shared(True) -- die Quelle ist
+    # nur einmal oeffenbar -- ist mit der persistenten Capture obsolet. Und
+    # WICHTIG: bei geteilter Media treffen die PAUSED-Zyklen, die gst-rtsp-
+    # server bei jedem Client-SETUP/PLAY/TEARDOWN faehrt, ALLE Zuschauer
+    # (gemessen 15.08.: 1-6 s Luecken bei jedem Join/Leave). Private Medias
+    # stoeren nur den Client, der gerade kommt oder geht.
+    factory.set_shared(False)
     factory.set_latency(0)
     factory.set_protocols(GstRtsp.RTSPLowerTrans.UDP)  # kein TCP-Fallback, kein Resend
     factory.connect('media-configure', on_media_configure, cfg)
+    factory.connect('media-configure', lambda f, m: hub.attach(m))
     server.get_mount_points().add_factory(cfg['mount'], factory)
     install_session_reaper(server, cfg)
     server.attach(None)
