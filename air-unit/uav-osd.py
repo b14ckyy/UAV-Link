@@ -63,7 +63,10 @@ POLL_INTERVAL = 0.5
 POLL_FRAME = bytes([ord('$'), ord('M'), ord('<'), 0,
                     MSP_FC_VARIANT, MSP_FC_VARIANT])
 
-GRIDS = {0: (16, 30), 1: (18, 50), 2: (20, 53), 3: (20, 53)}
+# MSP_DP_OPTIONS-Resolution-Index -> (rows, cols), Quelle INAV
+# displayport_msp_osd.c: 0=SD 30x16 (NTSC zeichnet nur 13 Zeilen),
+# 1=HDZero 50x18, 2=DJI-WTF 60x22, 3=Avatar/DJI-HD 53x20.
+GRIDS = {0: (16, 30), 1: (18, 50), 2: (22, 60), 3: (20, 53)}
 DEFAULT_GRID = (20, 53)
 
 
