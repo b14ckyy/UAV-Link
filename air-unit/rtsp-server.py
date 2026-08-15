@@ -531,7 +531,11 @@ class OsdEngine:
         # (720 -> 24x36, 1080 -> 36x54); Breite = 2/3 der Hoehe, auf
         # gerade Werte gerundet (UYVY-Paar-Alignment).
         self.cell_h = height // 20
-        self.cell_w = (self.cell_h * 2 // 3) & ~1
+        # Breite: 2:3-Aspekt, aber so geklemmt, dass auch das breiteste Grid
+        # (53 Spalten, HD) sicher ins Bild passt -- sonst wird der Zentrier-
+        # Offset negativ und die Lauftabelle schreibt ausserhalb der Zeile
+        # (bei schmalen Signalen wie 640/720 Pixel Breite).
+        self.cell_w = min(self.cell_h * 2 // 3, width // 53) & ~1
         lib_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'libosdstamp.so')
         self.lib = ctypes.CDLL(lib_path)
@@ -637,6 +641,11 @@ class OsdEngine:
         # Canvas zentrieren (auch SD-Grids landen mittig im Bild)
         x0 = (self.W - cols * self.cell_w) // 2 & ~1
         y0 = (self.H - rows * self.cell_h) // 2
+        if x0 < 0 or y0 < 0:
+            # Grid passt nicht ins Bild -- lieber kein OSD als korrupte
+            # Laeufe ausserhalb der Zeilen (zerrissenes Bild).
+            self.tables = None
+            return
         parts = []
         for i, glyph_idx in enumerate(grid):
             if not glyph_idx:
