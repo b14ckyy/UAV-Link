@@ -232,9 +232,13 @@ def watch_signal(src):
         time.sleep(SIGNAL_POLL_S)
         g = query_geometry(src['dev'])
         now = (g['width'], g['height'], g['framerate']) if g else None
-        # Rate 0 = Pixeltakt (noch) nicht lesbar -> nur Geometrie vergleichen
-        if now is not None and (now == expect
-                                or (now[2] == 0 and now[:2] == expect[:2])):
+        # Rate 0 = Pixeltakt (noch) nicht lesbar -> nur Geometrie vergleichen.
+        # Rate +-1 Hz tolerieren: die Rate ist aus dem Pixeltakt GERUNDET --
+        # eine krumme Quelle (Laptop liefert z.B. 800x600@60,75) pendelt
+        # sonst um die Rundungsgrenze und loest im Minutentakt grundlose
+        # Restarts aus (gemessen 15.08.: 60<->61-Flapping alle ~20 s).
+        if now is not None and now[:2] == expect[:2] and (
+                now[2] == 0 or abs(now[2] - expect[2]) <= 1):
             last = None
             continue
         if last is not None and now == last:
