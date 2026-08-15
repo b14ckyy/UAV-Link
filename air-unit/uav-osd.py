@@ -12,6 +12,13 @@ Grid-Paket (UDP an 127.0.0.1:OSD_UDP_PORT, nur bei "draw"):
   b'UOSD' | version u8 | rows u8 | cols u8 | 0 u8 | rows*cols * u16le
   u16 = Glyphenindex (Zeichen + Fontpage*256), 0 = leere Zelle.
 
+GCS-Downlink (UDP-Port DOWNLINK_PORT, IMMER aktiv, Spez: PROTOCOL-OSD.md):
+Die GCS abonniert per 'OSUB'-Keepalive (1 Hz) an Port 5762; gesendet wird
+an die beobachtete Absenderadresse (NAT-/WireGuard-tauglich). Jedes Paket
+ist ein vollstaendiger, RLE-komprimierter Grid-Schnappschuss -- Verlust
+ist egal, der naechste Draw ersetzt alles. Der Port ist API-Konstante
+(hardcoded); die Web-UI verweigert ihn fuer den Serial-Tunnel.
+
 Konfiguration (config.json, per Web-UI):
   "osd": { "enabled": bool, "mode": "burnin"|"downlink",
            "uart": "/dev/serial0", "baud": 115200 }
@@ -32,7 +39,11 @@ import time
 DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(DIR, 'config.json')
 STATUS_PATH = '/run/uav-osd/status'
-OSD_UDP_PORT = 5761
+OSD_UDP_PORT = 5761       # intern (localhost -> rtsp-server/Burn-in)
+DOWNLINK_PORT = 5762      # API-Konstante GCS-Downlink -- NICHT konfigurierbar
+DOWNLINK_MAX = 1400       # max Payload/Paket (WireGuard-MTU ~1420)
+SUB_TIMEOUT = 5.0         # Subscriber ohne Keepalive fliegen raus
+HEARTBEAT = 1.0           # Downlink-Takt auch ohne FC-Draws
 
 # MSP-DisplayPort-Subkommandos (Betaflight/INAV displayport_msp)
 DP_HEARTBEAT = 0
@@ -197,6 +208,87 @@ class OsdState:
                 + struct.pack(f'<{len(self.grid)}H', *self.grid))
 
 
+class Downlink:
+    """GCS-Abo-Verwaltung + Grid-Snapshots per UDP (Spez: PROTOCOL-OSD.md).
+
+    Immer aktiv: gesendet wird nur an Adressen, die per 'OSUB'-Keepalive
+    abonniert haben -- ohne Abo kostet das hier nichts.
+    """
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('', DOWNLINK_PORT))
+        self.sock.setblocking(False)
+        self.subs = {}                 # addr -> letzter Keepalive
+        self.seq = 0
+        self._last = None              # zuletzt gesendetes Grid
+
+    def poll_subs(self, now):
+        try:
+            while True:
+                data, addr = self.sock.recvfrom(64)
+                if data[:4] == b'OSUB':
+                    if addr not in self.subs:
+                        log(f'GCS abonniert: {addr[0]}:{addr[1]}')
+                    self.subs[addr] = now
+        except (BlockingIOError, InterruptedError):
+            pass
+        for a in [a for a, t in self.subs.items()
+                  if now - t > SUB_TIMEOUT]:
+            del self.subs[a]
+            log(f'GCS-Abo abgelaufen: {a[0]}:{a[1]}')
+
+    @staticmethod
+    def _rle(cells):
+        # u16-Tokens: 0xFFFF-Escape + Anzahl Nullzellen, sonst Literal.
+        out = []
+        i, n = 0, len(cells)
+        while i < n:
+            if cells[i]:
+                out.append(cells[i])
+                i += 1
+            else:
+                j = i + 1
+                while j < n and not cells[j]:
+                    j += 1
+                out.append(0xFFFF)
+                out.append(j - i)
+                i = j
+        return out
+
+    def send(self, state, fc_alive, force=False):
+        # INAV zeichnet ~46x/s, der Inhalt aendert sich aber nur selten --
+        # unveraenderte Grids kosten sonst grundlos ~190 kbit/s. Der 1-Hz-
+        # Heartbeat (force=True) traegt die Liveness, nicht die Draw-Rate.
+        if not self.subs:
+            return
+        cur = tuple(state.grid)
+        if not force and cur == self._last:
+            return
+        self._last = cur
+        self.seq = (self.seq + 1) & 0xFFFF
+        toks = self._rle(state.grid)
+        if 14 + 2 * len(toks) <= DOWNLINK_MAX:
+            stripes = [(0, state.rows, toks)]
+        else:
+            # Sehr dichtes Grid: als zwei Zeilenstreifen (je < MTU)
+            half = state.rows // 2
+            stripes = []
+            for r0, nr in ((0, half), (half, state.rows - half)):
+                seg = state.grid[r0 * state.cols:(r0 + nr) * state.cols]
+                stripes.append((r0, nr, self._rle(seg)))
+        for r0, nr, t in stripes:
+            pkt = (struct.pack('<4sBBBBHBBBB', b'UOSD', 1, 1,
+                               state.rows, state.cols, self.seq,
+                               r0, nr, 1 if fc_alive else 0, 0)
+                   + struct.pack(f'<{len(t)}H', *t))
+            for addr in list(self.subs):
+                try:
+                    self.sock.sendto(pkt, addr)
+                except OSError:
+                    pass
+
+
 def main():
     try:
         with open(CONFIG_PATH) as f:
@@ -212,28 +304,36 @@ def main():
     baud = int(osd.get('baud', 115200))
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dlink = Downlink()
     state = OsdState()
     parser = MspParser()
     fd = None
     last_status = 0.0
     last_poll = 0.0
+    last_hb = 0.0
+    last_open = -10.0
     fc_variant = None
     draws_window = []
 
-    log(f'MSP-DisplayPort-Reader: {dev} @ {baud}')
+    log(f'MSP-DisplayPort-Reader: {dev} @ {baud}, '
+        f'GCS-Downlink auf UDP {DOWNLINK_PORT}')
     while True:
-        if fd is None:
+        now = time.monotonic()
+        # UART (wieder) oeffnen -- nicht blockierend warten, der Downlink
+        # (Abos + Heartbeat) laeuft auch ohne FC weiter.
+        if fd is None and now - last_open >= 3.0:
+            last_open = now
             try:
                 fd = open_serial(dev, baud)
                 log(f'UART offen: {dev}')
             except OSError as e:
                 write_status({'state': 'no-uart', 'uart': dev,
                               'error': str(e)})
-                time.sleep(3)
-                continue
-        r, _, _ = select.select([fd], [], [], 0.5)
+        rl = [dlink.sock] if fd is None else [fd, dlink.sock]
+        r, _, _ = select.select(rl, [], [], 0.5)
         now = time.monotonic()
-        if now - last_poll >= POLL_INTERVAL:
+        dlink.poll_subs(now)
+        if fd is not None and now - last_poll >= POLL_INTERVAL:
             last_poll = now
             try:
                 os.write(fd, POLL_FRAME)
@@ -242,7 +342,7 @@ def main():
                 fd = None
                 log('UART-Schreibfehler -- neu verbinden')
                 continue
-        if r:
+        if fd is not None and fd in r:
             try:
                 data = os.read(fd, 4096)
             except OSError:
@@ -271,8 +371,12 @@ def main():
                     draws_window.append(now)
                     sock.sendto(state.packet(),
                                 ('127.0.0.1', OSD_UDP_PORT))
+                    dlink.send(state, True)
                 elif sub == DP_OPTIONS and len(payload) >= 3:
                     state.set_grid(*GRIDS.get(payload[2], DEFAULT_GRID))
+        if now - last_hb >= HEARTBEAT:
+            last_hb = now
+            dlink.send(state, now - state.last_draw < 3.0, force=True)
         if now - last_status >= 2.0:
             last_status = now
             draws_window = [t for t in draws_window if now - t < 5.0]
@@ -284,6 +388,7 @@ def main():
                 'draw_hz': round(len(draws_window) / 5.0, 1),
                 'mode': osd.get('mode', 'burnin'),
                 'fc': fc_variant,
+                'gcs_subs': len(dlink.subs),
             })
 
 

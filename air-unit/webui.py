@@ -1552,6 +1552,19 @@ def osd_save():
     return redirect('/')
 
 
+@app.route('/osd_font', methods=['GET'])
+def osd_font_get():
+    """Aktuelle OSD-Font als PNG -- OPTIONAL fuer die GCS (PROTOCOL-OSD.md).
+
+    Die GCS entscheidet selbst, ob sie die Unit-Font zieht oder eine
+    eigene rendert; dieser Endpoint macht nur die Unit-Font verfuegbar.
+    """
+    try:
+        return send_file(OSD_FONT_PATH, mimetype='image/png')
+    except (OSError, FileNotFoundError):
+        return ('no font uploaded', 404)
+
+
 @app.route('/osd_font', methods=['POST'])
 def osd_font():
     f = request.files.get('font')
@@ -1724,7 +1737,9 @@ def msp_save():
         port = int(request.form.get('udp_port', 5760))
     except ValueError:
         port = 5760
-    if 0 < port <= 65535:
+    # 5761/5762 sind API-Konstanten des OSD (intern/GCS-Downlink,
+    # s. PROTOCOL-OSD.md) -- fuer den Serial-Tunnel gesperrt.
+    if 0 < port <= 65535 and port not in (5761, 5762):
         m['udp_port'] = port
     m['inject_link_stats'] = request.form.get('inject') == 'on'
     m['arm_wifi_off'] = request.form.get('arm_wifi_off') == 'on'
