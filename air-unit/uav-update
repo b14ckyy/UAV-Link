@@ -18,6 +18,16 @@ exec >>"$LOG" 2>&1
 echo "=========================================================="
 echo "[uav-update] $(date -u '+%Y-%m-%dT%H:%M:%SZ') channel=$CHANNEL"
 
+# Nur EIN Update-Lauf zur Zeit. uav-update@dev und uav-update@<sha> sind
+# VERSCHIEDENE systemd-Instanzen -- systemd serialisiert sie nicht. Zwei
+# parallele install.sh haben am 15.08. config.txt/cmdline.txt auf 0 Bytes
+# zerlegt (beide schreiben mit >>/sed an denselben Boot-Dateien).
+exec 9>>/run/lock/uav-update.lock
+if ! flock -w 900 9; then
+    echo "[uav-update] anderer Update-Lauf haengt seit >15 min -- Abbruch"
+    exit 1
+fi
+
 api() { curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/$1"; }
 tag_of() { grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'; }
 
