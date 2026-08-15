@@ -1063,25 +1063,34 @@ class StreamHub:
     Kite-Auto-Reconnects, die Session-Leichen ohne TEARDOWN hinterlassen)
     wuergten die Kamera so in einer selbsterhaltenden Freeze-Schleife ab.
 
-    Deshalb laufen Quelle und Encoder HIER, dauerhaft und clientunabhaengig;
-    die Media bekommt fertige Frames per appsrc. Ihre PAUSED-Zyklen treffen
-    nur noch appsrc -- die Kamera merkt von Clients nichts mehr. Nebenbei:
-    das juengste Keyframe (h264) bzw. JPEG liegt immer aktuell in /tmp,
-    die Web-UI-Preview braucht damit ebenfalls keinen RTSP-Client mehr.
+    Quelle und Encoder laufen HIER, aber LAZY: gestartet beim ersten
+    Client, gestoppt GRACE_S Sekunden nach dem letzten -- im Leerlauf
+    null Systemlast und Kamera aus (die permanente Variante kostete
+    konstant ~1,5 Kerne, 15.08. abends zurueckgebaut). Die Nachlauffrist
+    ueberbrueckt Client-Reconnects (Kite!), ohne die Kamera zu stoppen;
+    solange ein Client dranbleibt, treffen PAUSED-Zyklen anderer Clients
+    weiterhin nur appsrc. Waehrend des Betriebs liegt das juengste
+    Keyframe (h264) bzw. JPEG in /tmp fuer die Web-UI-Preview (im
+    Leerlauf veraltet sie entsprechend).
     """
+
+    GRACE_S = 15                       # Nachlauf nach letztem Client
 
     def __init__(self, launch, is_h264):
         self.lock = threading.Lock()
         self.srcs = {}                 # appsrc -> darf schon Frames sehen
         self.is_h264 = is_h264
         self._last_save = 0.0
+        self._running = False
+        self._stop_id = 0              # anstehender Nachlauf-Stopp (GLib)
+        self._got_frame = threading.Event()
         self.pipe = Gst.parse_launch(launch)
         sink = self.pipe.get_by_name('vidsink')
         sink.connect('new-sample', self._on_sample)
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect('message::error', self._on_error)
-        self.pipe.set_state(Gst.State.PLAYING)
+        # Kein PLAYING hier -- Capture startet erst mit dem ersten Client.
 
     def _on_error(self, bus, msg):
         err, _ = msg.parse_error()
@@ -1097,11 +1106,41 @@ class StreamHub:
         # jedes Frame steht fuer sich.
         with self.lock:
             self.srcs[s] = not self.is_h264
+            if self._stop_id:
+                GLib.source_remove(self._stop_id)
+                self._stop_id = 0
+            start = not self._running
+            self._running = True
+        if start:
+            log('Capture startet (erster Client)')
+            self.pipe.set_state(Gst.State.PLAYING)
+        # Kaltstart abfedern: ohne fliessende Frames hat h264parse in der
+        # Media noch keine Caps und das SDP der ALLERERSTEN DESCRIBE-
+        # Anfrage schluege fehl (503). Begrenzt warten, bis die Quelle
+        # liefert (UVC braucht nach dem Start 1-5 s); klappt es nicht,
+        # faengt der Client-Retry den Rest.
+        if start and not self._got_frame.wait(8):
+            log('Capture: Quelle liefert noch nichts (Kaltstart-Timeout)')
         media.connect('unprepared', self._detach, s)
 
     def _detach(self, media, s):
         with self.lock:
             self.srcs.pop(s, None)
+            if self.srcs or not self._running or self._stop_id:
+                return
+            self._stop_id = GLib.timeout_add_seconds(self.GRACE_S,
+                                                     self._idle_stop)
+
+    def _idle_stop(self):
+        with self.lock:
+            self._stop_id = 0
+            if self.srcs or not self._running:
+                return False           # doch wieder Publikum -- weiterlaufen
+            self._running = False
+        log(f'Capture stoppt ({self.GRACE_S} s ohne Client)')
+        self._got_frame.clear()
+        self.pipe.set_state(Gst.State.NULL)
+        return False
 
     def _on_sample(self, sink):
         sample = sink.emit('pull-sample')
@@ -1114,6 +1153,7 @@ class StreamHub:
             return Gst.FlowReturn.OK
         data = bytes(m.data)
         buf.unmap(m)
+        self._got_frame.set()
         if key or not self.is_h264:
             self._save_snapshot(data)
         with self.lock:
@@ -1242,8 +1282,8 @@ def main():
             OSD_ENGINE = None
     capture, media_launch, is_h264 = build_pipelines(cfg, src)
     hub = StreamHub(capture, is_h264)
-    log('Capture-Pipeline laeuft persistent -- Client-Wechsel beruehren '
-        'die Quelle nicht mehr (s. StreamHub)')
+    log('Capture-Pipeline lazy: startet mit dem ersten Client, stoppt '
+        f'{StreamHub.GRACE_S} s nach dem letzten (s. StreamHub)')
     server = GstRtspServer.RTSPServer()
     server.set_service(str(cfg['port']))
     factory = GstRtspServer.RTSPMediaFactory()
