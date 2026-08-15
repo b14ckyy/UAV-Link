@@ -430,6 +430,13 @@ def build_pipelines(cfg, src):
     # jede Stanz-Millisekunde ~3 fps). max-size-buffers=2 haelt die
     # Zusatzlatenz bei maximal einem Frame.
     osd = '! osdstamp ! queue max-size-buffers=2 ' if OSD_ENGINE else ''
+    if OSD_ENGINE and not raw:
+        # MJPEG-Pfad: zusaetzlich eine queue VOR dem Stanzer. Der SW-JPEG-
+        # Decode laeuft sonst mit dem Stanzen im selben Thread -- bei
+        # 720p30 sattelte der auf 85 % eines Kerns und beides zusammen riss
+        # die 30 fps (gemessen 27,8 fps, stille appsink-Drops als sporadische
+        # Mikro-Freezes beim Client). So bekommt jedes seinen eigenen Kern.
+        osd = '! queue max-size-buffers=2 ' + osd
     scale = ''
     if raw and fps < src['framerate']:
         scale += f'! videorate drop-only=true ! video/x-raw,framerate={fps}/1 '
@@ -625,15 +632,27 @@ class OsdEngine:
         else:
             raise ValueError(f'OSD: Format {fmt} nicht unterstuetzt')
         with self._cl:
+            # Nur Plane-OFFSETS anders (z. B. Alignment-Padding zwischen den
+            # Planes laut GstVideoMeta), Strides/Format/Groesse gleich? Dann
+            # reicht ein Offset-Update -- die Fragmente (stride-abhaengig)
+            # bleiben gueltig. WICHTIG: kein Voll-Rebake im Streaming-Thread,
+            # der blockiert sonst 1-2 s die Pipeline (Client-Reconnect!).
+            cheap = (self._layout is not None
+                     and (fmt, W, H) == (self.fmt, self.W, self.H)
+                     and [p[1] for p in planes]
+                     == [p[1] for p in self.planes])
             self.fmt, self.W, self.H, self.planes = fmt, W, H, planes
             self.tables = self.btables = None  # alte Offsets sind ungueltig
-            if self.grid_dims:
+            if self.grid_dims and not cheap:
                 self._set_cell()               # neu einbacken, Grid bekannt
             self._layout = key
             self._last_grid = None             # naechstes Grid baut neu
-        log(f'OSD-Layout: {fmt} {W}x{H}, Zelle '
-            + (f'{self.cell_w}x{self.cell_h}' if self.grid_dims
-               else 'folgt mit erstem FC-Grid'))
+        if cheap:
+            log(f'OSD-Layout: Plane-Offsets aktualisiert ({fmt} {W}x{H})')
+        else:
+            log(f'OSD-Layout: {fmt} {W}x{H}, Zelle '
+                + (f'{self.cell_w}x{self.cell_h}' if self.grid_dims
+                   else 'folgt mit erstem FC-Grid'))
 
     def _set_cell(self):
         """Zellgroesse aus Bild UND Grid -- das Grid waehlt der User in INAV.
@@ -994,12 +1013,14 @@ def register_osd_element(engine):
 
         def do_set_caps(self, incaps, outcaps):
             # Ausgehandeltes Format uebernehmen (z. B. Y42B statt I420,
-            # wenn die Kamera 4:2:2-JPEGs liefert).
+            # wenn die Kamera 4:2:2-JPEGs liefert). Ueber den Caps-STRING:
+            # PyGIs Structure-Wrapper hat kein get_string/get_value.
             try:
-                s = incaps.get_structure(0)
-                engine.set_layout(s.get_string('format'),
-                                  s.get_value('width'),
-                                  s.get_value('height'))
+                s = incaps.to_string()
+                fmt = re.search(r'format=\(string\)(\w+)', s).group(1)
+                w = int(re.search(r'width=\(int\)(\d+)', s).group(1))
+                h = int(re.search(r'height=\(int\)(\d+)', s).group(1))
+                engine.set_layout(fmt, w, h)
             except Exception as e:   # noqa: BLE001 -- Stream schuetzen
                 log(f'osdstamp set_caps: {e}')
             return True
