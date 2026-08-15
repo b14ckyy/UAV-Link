@@ -114,6 +114,11 @@ log "installing nftables firewall..."
 cp "$REPO/air-unit/uav-firewall.nft" /etc/nftables.conf
 systemctl enable nftables >/dev/null 2>&1
 
+# --- 7b. udev: ModemManager weg von den AT-Ports (USB-Stoerung, s. Datei) ------
+log "installing udev rule (ModemManager QMI-only)..."
+cp "$REPO/system/udev-99-uav-mm-ignore-at.rules" \
+    /etc/udev/rules.d/99-uav-mm-ignore-at.rules
+
 # --- 8. boot config (config.txt / cmdline.txt) ---------------------------------
 CFG=/boot/firmware/config.txt; [ -f "$CFG" ] || CFG=/boot/config.txt
 CMD=/boot/firmware/cmdline.txt; [ -f "$CMD" ] || CMD=/boot/cmdline.txt

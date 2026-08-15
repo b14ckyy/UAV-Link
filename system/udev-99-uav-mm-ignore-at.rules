@@ -1,0 +1,11 @@
+# UAV-Link: ModemManager von den AT-Serial-Ports des LTE-Modems fernhalten.
+#
+# Das SIM7600G-H exponiert neben QMI (cdc-wdm0) fuenf ttyUSB-AT-Ports.
+# ModemManagers periodisches Gepolle auf diesen Ports stoert auf dem
+# geteilten dwc2-USB-Bus des Zero 2 W das isochrone UVC-Kamera-Streaming:
+# gemessen 15.08.2026 als 5-15-s-Stalls alle 15-30 s (LifeCam) bzw.
+# komplette Bus-Abwuerfe (Dell WB7022). Mit ignorierten AT-Ports managt
+# MM das Modem rein ueber QMI -- Verbindung/Bearer voll funktionsfaehig,
+# Kamera-Stalls weg (120-s-Messung: 29,8 fps, eine 1-s-Luecke statt
+# Dauerstoerung). Details docs/STATUS.md 15.08.
+ACTION=="add|change", SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="1e0e", ENV{ID_MM_PORT_IGNORE}="1"
