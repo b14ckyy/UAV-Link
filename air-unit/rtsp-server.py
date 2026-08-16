@@ -18,7 +18,6 @@ import json
 import os
 import re
 import signal
-import struct
 import subprocess
 import sys
 import threading
@@ -588,23 +587,36 @@ class OsdEngine:
         self.lib.blend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_uint32]
+        self.lib.build_runs.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,   # grid,rows,cols
+            ctypes.c_void_p, ctypes.c_uint32,                    # geom, n_planes
+            ctypes.c_uint32, ctypes.c_uint32,                    # x0, y0
+            ctypes.c_uint32, ctypes.c_uint32,                    # cell_w, cell_h
+            ctypes.c_void_p, ctypes.c_void_p,                    # fstart, fcnt
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,   # frel,fsrc,flen
+            ctypes.c_void_p, ctypes.c_uint32]                    # out, cap
+        self.lib.build_runs.restype = ctypes.c_uint32
         self.ctypes = ctypes
         self._font_cell = None        # Zellgroesse, fuer die das PNG geladen ist
         self._layout = None           # (fmt, W, H, offsets, strides)
         self._meta_key = None         # zuletzt gesehene GstVideoMeta-Geometrie
         self.grid_dims = None         # (rows, cols) des FC-Grids -- adaptiv
         self.cell_w = self.cell_h = 0
-        self.glyphs = []
         # Kompilieren (Listener- ODER Streaming-Thread) gegeneinander
         # serialisieren; stamp() bleibt lock-frei ueber Tabellen-Snapshots.
         self._cl = threading.Lock()
         self.tables = None            # opak:  (runs_ptr, n_runs, runs_ref)
         self.btables = None           # Saum: dito, Pools bval/balf parallel
         self._last_grid = None
-        # Timing-Diagnose (UAV_OSD_TIMING=1 in der Service-Umgebung)
+        # Timing-Diagnose (UAV_OSD_TIMING=1 in der Service-Umgebung);
+        # Rebuild-Ausreisser (>30 ms) werden IMMER geloggt, ratenlimitiert --
+        # das ist der Nachweis-Kanal fuer die 50-90-ms-Burst-Klasse (16.08.).
         self._timing = bool(os.environ.get('UAV_OSD_TIMING'))
         self._tsum = self._tmax = 0.0
         self._tn = 0
+        self._rb_sum = self._rb_max = 0.0
+        self._rb_n = 0
+        self._rb_warn = 0.0
         self.set_layout(fmt, width, height)
         self._start_listener()
 
@@ -877,21 +889,73 @@ class OsdEngine:
         self.pool_ptr = self.pool.ctypes.data_as(self.ctypes.c_void_p)
         self.bval_ptr = self.bval.ctypes.data_as(self.ctypes.c_void_p)
         self.balf_ptr = self.balf.ctypes.data_as(self.ctypes.c_void_p)
-        self.glyphs = glyphs
         self.n_glyphs = sum(1 for g in glyphs if g is not None)
+
+        # Fragmente in flache, C-adressierbare Tabellen giessen: pro
+        # (Glyphe, Plane) ein (start, count)-Fenster in drei parallele
+        # uint32-Arrays (rel/src/len). build_runs() im C-Stanzer baut daraus
+        # die Lauftabelle -- der numpy-Bau hier in Python hielt den GIL
+        # 50-90 ms pro Grid-Update und riss Luecken in den 60-fps-Stream.
+        n_pl = len(self.planes)
+        op_start = np.zeros(512 * n_pl, np.uint32)
+        op_cnt = np.zeros(512 * n_pl, np.uint32)
+        bl_start = np.zeros(512 * n_pl, np.uint32)
+        bl_cnt = np.zeros(512 * n_pl, np.uint32)
+        op_r, op_s, op_l, bl_r, bl_s, bl_l = ([] for _ in range(6))
+        no = nb = 0
+        for gi, frags in enumerate(glyphs):
+            if frags is None:
+                continue
+            for p, (rel, src, lens, rel_b, src_b, lens_b) in enumerate(frags):
+                k = gi * n_pl + p
+                op_start[k], op_cnt[k] = no, len(lens)
+                no += len(lens)
+                op_r.append(rel), op_s.append(src), op_l.append(lens)
+                bl_start[k], bl_cnt[k] = nb, len(lens_b)
+                nb += len(lens_b)
+                bl_r.append(rel_b), bl_s.append(src_b), bl_l.append(lens_b)
+        zu = np.zeros(0, dtype=np.uint32)
+
+        def cat(parts):
+            return np.ascontiguousarray(
+                np.concatenate(parts or [zu]).astype(np.uint32))
+        self._opf = (cat(op_r), cat(op_s), cat(op_l), op_start, op_cnt)
+        self._blf = (cat(bl_r), cat(bl_s), cat(bl_l), bl_start, bl_cnt)
+        # Laufsummen pro Glyphe fuer die exakte Ausgabegroesse (Gather im
+        # Rebuild). Index 0 = leer, auch wenn der Font dort Pixel hat --
+        # build_runs() ueberspringt Glyphe 0 genauso (wie vorher Python).
+        self._op_cell = op_cnt.reshape(512, n_pl).sum(axis=1).astype(np.int64)
+        self._bl_cell = bl_cnt.reshape(512, n_pl).sum(axis=1).astype(np.int64)
+        self._op_cell[0] = self._bl_cell[0] = 0
 
     # --- Grid-Paket -> flache Lauftabelle -------------------------------------
     def rebuild(self, rows, cols, grid):
+        """grid: rohe LE-uint16-Bytes direkt aus dem UDP-Paket."""
         # INAV zeichnet mit ~46 Hz, meist ohne inhaltliche Aenderung --
-        # identische Grids kosten dann nur diesen Vergleich.
+        # identische Grids kosten dann nur diesen Byte-Vergleich.
         key = (rows, cols, grid)
         if key == self._last_grid:
             return
+        bake = (rows, cols) != self.grid_dims   # Font-Neueinbacken (~1 s) ok
+        t0 = time.monotonic()
         with self._cl:
             self._rebuild(rows, cols, grid, key)
+        dt = time.monotonic() - t0
+        self._rb_sum += dt
+        self._rb_max = max(self._rb_max, dt)
+        self._rb_n += 1
+        if dt > 0.03 and not bake and t0 - self._rb_warn > 10:
+            self._rb_warn = t0
+            log(f'osd-rebuild-AUSREISSER: {dt * 1e3:.1f} ms')
+        if self._timing and self._rb_n >= 100:
+            log(f'osd-rebuild: avg {self._rb_sum / self._rb_n * 1e3:.2f} ms, '
+                f'max {self._rb_max * 1e3:.2f} ms ({self._rb_n} Rebuilds)')
+            self._rb_sum = self._rb_max = 0.0
+            self._rb_n = 0
 
     def _rebuild(self, rows, cols, grid, key):
-        if not (0 < rows <= 32 and 0 < cols <= 64):
+        if not (0 < rows <= 32 and 0 < cols <= 64) \
+                or len(grid) != 2 * rows * cols:
             return
         if (rows, cols) != self.grid_dims:
             # Adaptive Zellgroesse: der FC bestimmt das Grid (HD 53x20,
@@ -912,40 +976,45 @@ class OsdEngine:
             # Laeufe ausserhalb der Zeilen (zerrissenes Bild).
             self.tables = self.btables = None
             return
-        parts, bparts = [], []
-        for i, glyph_idx in enumerate(grid):
-            if not glyph_idx:
-                continue
-            g = self.glyphs[glyph_idx] if glyph_idx < 512 else None
-            if g is None:
-                continue
-            r, c = divmod(i, cols)
-            px = x0 + c * self.cell_w
-            py = y0 + r * self.cell_h
-            for (off, stride, hs, vs, bpp), frag in zip(self.planes, g):
-                base = np.uint32(off + (py >> vs) * stride
-                                 + (px >> hs) * bpp)
-                rel, src, lens, rel_b, src_b, lens_b = frag
-                if len(lens):
-                    parts.append((rel + base, src, lens))
-                if len(lens_b):
-                    bparts.append((rel_b + base, src_b, lens_b))
+        # Tabellenbau komplett in C (build_runs): ctypes gibt den GIL fuer
+        # die Dauer des Aufrufs frei, der Streaming-Thread laeuft ungestoert
+        # weiter. Python macht nur noch: exakte Groesse per Gather zaehlen,
+        # Puffer anlegen, Pointer reichen -- Mikrosekunden statt 50-90 ms.
+        gidx = np.frombuffer(grid, dtype='<u2')
+        safe = np.where(gidx < 512, gidx, 0)    # >=512 zaehlt wie leer
+        geom = np.ascontiguousarray(
+            np.array(self.planes, dtype=np.uint32).reshape(-1))
 
-        def flatten(plist, *pools):
-            # Snapshot-Tupel: Laeufe UND die dazugehoerigen Pool-Pointer
-            # derselben Compile-Generation -- stamp() liest lock-frei und
-            # darf nie neue Laeufe mit alten Pools mischen (oder umgekehrt).
-            if not plist:
+        def build(frag, n):
+            if not n:
                 return None
-            runs = np.ascontiguousarray(np.column_stack(
-                [np.concatenate([p[j] for p in plist]) for j in range(3)]
-            ).astype(np.uint32).reshape(-1))
-            return (runs.ctypes.data_as(self.ctypes.c_void_p),
-                    len(runs) // 3, runs) + pools
+            rel, src, lens, start, cnt = frag
+            runs = np.empty(3 * n, dtype=np.uint32)
+            got = self.lib.build_runs(
+                gidx.ctypes.data, rows, cols,
+                geom.ctypes.data, len(self.planes),
+                x0, y0, self.cell_w, self.cell_h,
+                start.ctypes.data, cnt.ctypes.data,
+                rel.ctypes.data, src.ctypes.data, lens.ctypes.data,
+                runs.ctypes.data, n)
+            if got != n:
+                log(f'OSD-Rebuild: C fuellte {got}/{n} Laeufe -- '
+                    f'Tabelle verworfen')
+                return None
+            return runs
 
-        self.tables = flatten(parts, self.pool_ptr, self.pool)
-        self.btables = flatten(bparts, self.bval_ptr, self.balf_ptr,
-                               self.bval, self.balf)
+        # Snapshot-Tupel: Laeufe UND die dazugehoerigen Pool-Pointer
+        # derselben Compile-Generation -- stamp() liest lock-frei und
+        # darf nie neue Laeufe mit alten Pools mischen (oder umgekehrt).
+        r = build(self._opf, int(self._op_cell[safe].sum()))
+        b = build(self._blf, int(self._bl_cell[safe].sum()))
+        cvp = self.ctypes.c_void_p
+        self.tables = (None if r is None else
+                       (r.ctypes.data_as(cvp), len(r) // 3, r,
+                        self.pool_ptr, self.pool))
+        self.btables = (None if b is None else
+                        (b.ctypes.data_as(cvp), len(b) // 3, b,
+                         self.bval_ptr, self.balf_ptr, self.bval, self.balf))
 
     def _start_listener(self):
         import socket
@@ -963,8 +1032,7 @@ class OsdEngine:
                     n = rows * cols
                     if len(data) < 8 + 2 * n:
                         continue
-                    grid = struct.unpack_from(f'<{n}H', data, 8)
-                    self.rebuild(rows, cols, grid)
+                    self.rebuild(rows, cols, data[8:8 + 2 * n])
                 except Exception as e:   # noqa: BLE001 -- Stream schuetzen
                     log(f'OSD-Listener: {e}')
                     time.sleep(1)
