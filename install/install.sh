@@ -6,7 +6,7 @@
 #
 # Safe to re-run: existing config/credentials are preserved, boot-config edits are
 # added only once, packages/services/venv are only touched if needed. Reboot after
-# the first run (UART / I2C / dwc2 overlays need it).
+# the first run (UART / I2C overlays need it).
 set -uo pipefail
 
 log()  { echo "[uav-install] $*"; }
@@ -145,7 +145,17 @@ if [ -f "$CFG" ]; then
             echo "$1=$2" >> "$CFG"
         fi
     }
-    add_cfg "dtoverlay=dwc2,dr_mode=host"   # USB OTG host for CVBS dongle
+    # dtoverlay=dwc2 wird NICHT mehr gesetzt und aus bestehenden Installationen
+    # entfernt. Die Zeile stammt aus den CVBS-USB-Experimenten (Juli), war durch
+    # den add_cfg-Ganze-Datei-grep-Bug drei Wochen wirkungslos und wurde vom
+    # Bugfix am 13.08. unbeabsichtigt scharf geschaltet. Das Overlay tauscht den
+    # USB-Hosttreiber dwc_otg (FIQ, NAK-Holdoff, Microframe-Scheduler) gegen den
+    # Upstream-dwc2 -- dessen Isochron-Scheduling traegt die UVC-Last nicht:
+    # 720p60 (~42 Mbit) faellt komplett aus, 720p30 nur grenzwertig. Nachweis
+    # 16.08.: Reboot-Repro + dmesg-Treiber-Gegenprobe in beide Richtungen.
+    # dwc_otg ist auf dem Zero 2 W ohnehin im Host-Betrieb -- ein Monat
+    # Golden-Image-Betrieb lief ohne wirksames Overlay. Greift beim Boot.
+    sed -i '/^\[all\]/,$ { /^#\?dtoverlay=dwc2,dr_mode=host$/d }' "$CFG"
     add_cfg "enable_uart=1"                 # PL011 UART for MSP
     add_cfg "dtoverlay=disable-bt"          # free the UART
     add_cfg "dtparam=i2c_arm=on"            # OLED I2C
@@ -210,5 +220,5 @@ fi
 # --- 11. provisioning done: disable cloud-init for faster subsequent boots -----
 [ -d /etc/cloud ] && touch /etc/cloud/cloud-init.disabled
 
-log "DONE. Reboot to activate UART/I2C/dwc2, then open http://<pi>:8080"
+log "DONE. Reboot to activate UART/I2C, then open http://<pi>:8080"
 log "  (default web password: uavlink2026 — you'll be prompted to change it)"
