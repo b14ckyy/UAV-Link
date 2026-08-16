@@ -454,17 +454,26 @@ def build_pipelines(cfg, src):
     # ein exaktes Gitter (gemessen: stdev 1,55 ms -> 0,00 ms) und verwirft dafuer ~1,8 %
     # der Frames.
     #
-    # BRINGT IN DER PRAXIS NICHTS -- deshalb standardmaessig AUS ("smooth_pts": true zum
-    # Einschalten). Am Client gemessen: weiterhin ~100 Drops/30 s bei 720p60. Der Grund ist
-    # logisch: videorate korrigiert nur die ZEITSTEMPEL, die Frames KOMMEN aber weiterhin
-    # im 16/20-ms-Rhythmus an. Wer fast ohne Puffer abspielt, verwirft sie trotzdem.
+    # KORREKTUR 16.08.: Das damalige Fazit "bringt in der Praxis nichts" (~100 Drops/30 s
+    # trotz videorate) war ein Artefakt -- der appsrc der Client-Medias lief mit
+    # do-timestamp=true und hat die geglaetteten PTS mit der Push-Zeit UEBERSCHRIEBEN;
+    # am Client kam vom Gitter nie etwas an. Seit dem PTS-Durchreich-Fix (StreamHub
+    # traegt Capture-PTS offsetkorrigiert in die Medias) wirkt videorate erstmals bis
+    # zum Client durch. Standardwert bleibt vorerst AUS ("smooth_pts": true zum
+    # Einschalten); Neubewertung per Messung steht aus -- relevant v. a. fuer den
+    # USB-Dongle mit seinem 4-ms-Liefertakt, CSI stempelt schon sauber.
     # Geht ausserdem nur, wo dekodiert wird -- im MJPEG-Passthrough gibt es kein Rohbild.
     vrate = ('! videorate ! video/x-raw,framerate=%d/1 ' % fps
              if cfg.get('smooth_pts', False) else '')
     sink = ('! appsink name=vidsink emit-signals=true sync=false '
             'max-buffers=4 drop=true')
     jpeg_caps = f'image/jpeg,width={width},height={height},framerate={fps}/1'
-    asrc = ('appsrc name=vidsrc is-live=true format=time do-timestamp=true '
+    # KEIN do-timestamp: die PTS setzt StreamHub._on_sample (echte Capture-
+    # Zeitstempel, offsetkorrigiert). do-timestamp wuerde sie mit der Push-
+    # Zeit ueberschreiben und Scheduler-Jitter in die RTP-Timestamps stanzen
+    # (gemessen 16.08.: bei 30 fps nur 54 % der Frame-Abstaende im
+    # 30-35-ms-Bucket, Ausreisser 0-56 ms -- puffernlose Player ruckeln).
+    asrc = ('appsrc name=vidsrc is-live=true format=time '
             'max-buffers=60 leaky-type=downstream ')
     if codec == 'mjpeg-src':
         # Passthrough: das JPEG des Dongles unveraendert weiterreichen. Volle Quellqualitaet
@@ -1147,6 +1156,7 @@ class StreamHub:
     def __init__(self, launch, is_h264):
         self.lock = threading.Lock()
         self.srcs = {}                 # appsrc -> darf schon Frames sehen
+        self._pts_off = {}             # appsrc -> Capture-PTS-Offset (ns)
         self.is_h264 = is_h264
         self._last_save = 0.0
         self._running = False
@@ -1194,6 +1204,7 @@ class StreamHub:
     def _detach(self, media, s):
         with self.lock:
             self.srcs.pop(s, None)
+            self._pts_off.pop(s, None)
             if self.srcs or not self._running or self._stop_id:
                 return
             self._stop_id = GLib.timeout_add_seconds(self.GRACE_S,
@@ -1216,6 +1227,7 @@ class StreamHub:
             return Gst.FlowReturn.OK
         buf = sample.get_buffer()
         key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        pts, dur = buf.pts, buf.duration
         ok, m = buf.map(Gst.MapFlags.READ)
         if not ok:
             return Gst.FlowReturn.OK
@@ -1228,13 +1240,33 @@ class StreamHub:
             if self.is_h264 and key:
                 for s in self.srcs:
                     self.srcs[s] = True
-            targets = [s for s, ready in self.srcs.items() if ready]
-        for s in targets:
-            # Frische Buffer OHNE Timestamps pushen -- appsrc (do-timestamp)
-            # stempelt sie mit der Running-Time der jeweiligen Media.
-            # (Capture-PTS direkt durchreichen scheitert an der fremden
-            # Base-Time; PTS nullen scheitert an PyGIs Writability-Sperre.)
-            s.emit('push-buffer', Gst.Buffer.new_wrapped(data))
+            targets = []
+            for s, ready in self.srcs.items():
+                if not ready:
+                    continue
+                off = self._pts_off.get(s)
+                if off is None and pts != Gst.CLOCK_TIME_NONE:
+                    # Nullpunkt pro Media: Capture-PTS des ersten Frames auf
+                    # deren AKTUELLE Running-Time legen (Capture- und Media-
+                    # Pipeline teilen die Systemuhr, nur die Base-Times
+                    # differieren). Folgeframes tragen dann die ECHTEN
+                    # Capture-Abstaende -- nicht den Push-Jitter des Hubs.
+                    now = s.get_current_running_time()
+                    if now == Gst.CLOCK_TIME_NONE:
+                        now = 0
+                    off = pts - now
+                    self._pts_off[s] = off
+                targets.append((s, off))
+        for s, off in targets:
+            # new_wrapped liefert einen frischen, beschreibbaren Buffer --
+            # die alte "PyGI-Writability-Sperre" betraf nur den Versuch, die
+            # PTS des ORIGINAL-Buffers aus der Capture-Pipeline zu aendern.
+            nb = Gst.Buffer.new_wrapped(data)
+            if off is not None and pts != Gst.CLOCK_TIME_NONE:
+                nb.pts = pts - off
+                if dur != Gst.CLOCK_TIME_NONE:
+                    nb.duration = dur
+            s.emit('push-buffer', nb)
         return Gst.FlowReturn.OK
 
     def _save_snapshot(self, data):
